@@ -1,4 +1,4 @@
-name: Build Unsigned iOS IPA
+name: Build Versioned iOS IPA
 
 on:
   workflow_dispatch:
@@ -9,20 +9,36 @@ on:
 
 jobs:
   build-ipa:
-    name: Build BookSplitScanner.ipa on macOS
+    name: Build Versioned BookSplitScanner.ipa on macOS
     runs-on: macos-15
 
     steps:
       - name: 1. Tải mã nguồn từ Repository
         uses: actions/checkout@v4
 
-      - name: 2. Kiểm tra hoặc tự động tạo cấu hình XcodeGen (project.yml)
+      - name: 2. Đọc số phiên bản (APP_VERSION) và số thứ tự bản dựng (Build Number)
+        id: vars
         shell: bash
         run: |
           set -e
-          if [ ! -f "project.yml" ]; then
-            echo "Không tìm thấy project.yml, đang tự động tạo project.yml..."
-            cat << 'EOF' > project.yml
+          VER=$(grep -Eo 'let APP_VERSION = "[0-9]+\.[0-9]+\.[0-9]+"' BookSplitScannerApp.swift | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)
+          if [ -z "$VER" ]; then
+            VER="2.0.0"
+          fi
+          BUILD_NUM="${{ github.run_number }}"
+          IPA_NAME="BookSplitScanner-v${VER}-b${BUILD_NUM}.ipa"
+          ARTIFACT_NAME="BookSplitScanner-v${VER}-b${BUILD_NUM}"
+          echo "APP_VERSION=$VER" >> $GITHUB_ENV
+          echo "BUILD_NUM=$BUILD_NUM" >> $GITHUB_ENV
+          echo "IPA_NAME=$IPA_NAME" >> $GITHUB_ENV
+          echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> $GITHUB_ENV
+          echo "Đang chuẩn bị tạo phiên bản: v${VER} (Build ${BUILD_NUM}) -> ${IPA_NAME}"
+
+      - name: 3. Tạo cấu hình XcodeGen (project.yml) với số phiên bản tự động
+        shell: bash
+        run: |
+          set -e
+          cat << EOF > project.yml
           name: BookSplitScanner
           options:
             bundleIdPrefix: com.personal.booksplit
@@ -33,8 +49,8 @@ jobs:
               SWIFT_VERSION: "5.9"
               TARGETED_DEVICE_FAMILY: "1,2"
               IPHONEOS_DEPLOYMENT_TARGET: "16.0"
-              MARKETING_VERSION: "1.0.0"
-              CURRENT_PROJECT_VERSION: "1"
+              MARKETING_VERSION: "${APP_VERSION}"
+              CURRENT_PROJECT_VERSION: "${BUILD_NUM}"
           targets:
             BookSplitScanner:
               type: application
@@ -54,11 +70,11 @@ jobs:
                 properties:
                   CFBundleDisplayName: "BookSplit"
                   CFBundleName: "BookSplitScanner"
-                  CFBundleIdentifier: "$(PRODUCT_BUNDLE_IDENTIFIER)"
-                  CFBundleExecutable: "$(EXECUTABLE_NAME)"
-                  CFBundlePackageType: "$(PRODUCT_BUNDLE_PACKAGE_TYPE)"
-                  CFBundleShortVersionString: "1.0.0"
-                  CFBundleVersion: "1"
+                  CFBundleIdentifier: "\$(PRODUCT_BUNDLE_IDENTIFIER)"
+                  CFBundleExecutable: "\$(EXECUTABLE_NAME)"
+                  CFBundlePackageType: "\$(PRODUCT_BUNDLE_PACKAGE_TYPE)"
+                  CFBundleShortVersionString: "${APP_VERSION}"
+                  CFBundleVersion: "${BUILD_NUM}"
                   LSRequiresIPhoneOS: true
                   UIApplicationSceneManifest:
                     UIApplicationSupportsMultipleScenes: false
@@ -76,9 +92,8 @@ jobs:
                     - UIInterfaceOrientationLandscapeLeft
                     - UIInterfaceOrientationLandscapeRight
           EOF
-          fi
 
-      - name: 3. Cài đặt XcodeGen và khởi tạo dự án Xcode (.xcodeproj)
+      - name: 4. Cài đặt XcodeGen và khởi tạo dự án Xcode (.xcodeproj)
         shell: bash
         run: |
           if ! command -v xcodegen &> /dev/null; then
@@ -86,25 +101,26 @@ jobs:
           fi
           xcodegen generate
 
-      - name: 4. Biên dịch ứng dụng iOS (Release - Unsigned)
+      - name: 5. Biên dịch ứng dụng iOS (Release - v${{ env.APP_VERSION }} Build ${{ env.BUILD_NUM }})
         shell: bash
         run: |
-          xcodebuild clean build             -project BookSplitScanner.xcodeproj             -scheme BookSplitScanner             -configuration Release             -sdk iphoneos             -derivedDataPath build_output             CODE_SIGN_IDENTITY=""             CODE_SIGNING_REQUIRED=NO             CODE_SIGNING_ALLOWED=NO             AD_HOC_CODE_SIGNING_ALLOWED=YES
+          xcodebuild clean build             -project BookSplitScanner.xcodeproj             -scheme BookSplitScanner             -configuration Release             -sdk iphoneos             -derivedDataPath build_output             MARKETING_VERSION="${APP_VERSION}"             CURRENT_PROJECT_VERSION="${BUILD_NUM}"             CODE_SIGN_IDENTITY=""             CODE_SIGNING_REQUIRED=NO             CODE_SIGNING_ALLOWED=NO             AD_HOC_CODE_SIGNING_ALLOWED=YES
 
-      - name: 5. Ký Ad-Hoc và đóng gói thành file BookSplitScanner.ipa
+      - name: 6. Ký Ad-Hoc và đóng gói thành file ${{ env.IPA_NAME }}
         shell: bash
         run: |
-          rm -rf Payload BookSplitScanner.ipa
+          rm -rf Payload *.ipa
           mkdir -p Payload
           APP_PATH=$(find build_output -name "BookSplitScanner.app" -type d | head -n 1)
           echo "Found built app at: $APP_PATH"
           cp -R "$APP_PATH" Payload/
           codesign --force --deep --sign - Payload/BookSplitScanner.app
-          zip -r9 BookSplitScanner.ipa Payload
+          zip -r9 "${IPA_NAME}" Payload
+          ls -lh "${IPA_NAME}"
 
-      - name: 6. Tải file BookSplitScanner.ipa lên mục Artifacts để tải về
+      - name: 7. Tải file ${{ env.IPA_NAME }} lên mục Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: BookSplitScanner-IPA
-          path: BookSplitScanner.ipa
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.IPA_NAME }}
           retention-days: 30
