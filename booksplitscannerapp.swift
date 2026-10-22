@@ -8,7 +8,7 @@ import PhotosUI
 import UIKit
 
 // MARK: - App Version Constant (Tự động đọc bởi GitHub Actions để đặt tên file .ipa)
-let APP_VERSION = "2.1.0"
+let APP_VERSION = "2.2.0"
 
 enum AppVersionHelper {
     static var displayString: String {
@@ -653,6 +653,8 @@ final class VFlatCameraController: NSObject, ObservableObject {
     @Published var holdDurationSeconds: Double = 1.2
     @Published var shutterFlashTrigger: Bool = false
     @Published var cameraPermissionDenied: Bool = false
+    /// Tỷ lệ rộng/cao của khung hình video (dọc), dùng để quy đổi khung sách sang tọa độ Preview (resizeAspectFill)
+    @Published var previewBufferAspect: CGFloat = 3.0 / 4.0
 
     let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "com.personal.booksplit.camera.session")
@@ -671,6 +673,20 @@ final class VFlatCameraController: NSObject, ObservableObject {
     private var pageTurnMotionFrames: Int = 0
     private var isCapturingPhoto: Bool = false
     private var isSessionConfigured: Bool = false
+
+    // Tạo sẵn 1 lần, chỉ dùng trên videoOutputQueue
+    private let documentRequest = VNDetectDocumentSegmentationRequest()
+    private lazy var rectangleRequest: VNDetectRectanglesRequest = {
+        let request = VNDetectRectanglesRequest()
+        // Tỷ lệ cạnh ngắn/cạnh dài phải nằm trong [0, 1]
+        request.minimumAspectRatio = 0.3
+        request.maximumAspectRatio = 1.0
+        request.minimumSize = 0.3
+        request.minimumConfidence = 0.5
+        request.quadratureTolerance = 40 // Trang sách mở thường bị cong, không vuông góc tuyệt đối
+        request.maximumObservations = 4
+        return request
+    }()
 
     func startSession() {
         AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
@@ -731,6 +747,10 @@ final class VFlatCameraController: NSObject, ObservableObject {
         videoOutput.setSampleBufferDelegate(self, queue: videoOutputQueue)
         if session.canAddOutput(videoOutput) {
             session.addOutput(videoOutput)
+            // Xoay khung hình phân tích về chiều dọc giống Preview để tọa độ khung sách khớp với màn hình
+            if let conn = videoOutput.connection(with: .video), conn.isVideoOrientationSupported {
+                conn.videoOrientation = .portrait
+            }
         }
 
         session.commitConfiguration()
@@ -810,45 +830,54 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
 
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
-        // 1. Đo chuyển động khung hình + kiểm tra đặc trưng giấy & dòng chữ thực sự trên trang sách
-        let (motionScore, diffFromLastCapture, hasPaperAndTextFeatures) = analyzeFrameLumaAndBookFeatures(pixelBuffer: pixelBuffer)
+        // Khung hình video đã được xoay dọc (portrait) giống hệt Preview -> tọa độ Vision khớp với màn hình
+        let bufferWidth = CVPixelBufferGetWidth(pixelBuffer)
+        let bufferHeight = CVPixelBufferGetHeight(pixelBuffer)
+        let bufferAspect = CGFloat(bufferWidth) / CGFloat(max(1, bufferHeight))
 
-        // 2. Phát hiện biên dạng 4 cạnh trang sách bằng Apple Vision (VNDetectRectanglesRequest)
-        let rectRequest = VNDetectRectanglesRequest()
-        rectRequest.minimumAspectRatio = 0.45
-        rectRequest.maximumAspectRatio = 2.1
-        rectRequest.minimumSize = 0.36
-        rectRequest.minimumConfidence = 0.65
-        rectRequest.maximumObservations = 1
+        // 1. Đo chuyển động khung hình (rung tay / lật trang) và độ khác biệt so với trang vừa chụp
+        let (motionScore, diffFromLastCapture) = analyzeFrameMotion(pixelBuffer: pixelBuffer)
 
+        // 2. Tìm biên trang sách bằng Apple Vision:
+        //    - VNDetectDocumentSegmentationRequest (mô hình AI chuyên nhận diện giấy/tài liệu, hoạt động tốt với sách cong)
+        //    - VNDetectRectanglesRequest làm phương án dự phòng
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
-        try? handler.perform([rectRequest])
-
-        var rawBookDetected = false
-        var candidateRect = NormalizedBookRect.defaultSpread
-
-        if let obs = rectRequest.results?.first {
-            let bbox = obs.boundingBox
-            let area = bbox.width * bbox.height
-            // Trang sách phải chiếm ít nhất 26% diện tích khung hình VÀ bên trong phải có nền giấy sáng + mật độ dòng chữ in
-            if area >= 0.26 && obs.confidence >= 0.65 && hasPaperAndTextFeatures {
-                rawBookDetected = true
-                candidateRect = NormalizedBookRect(
-                    x: max(0.03, min(0.25, bbox.minX)),
-                    y: max(0.04, min(0.25, 1.0 - bbox.maxY)),
-                    width: min(0.94, max(0.50, bbox.width)),
-                    height: min(0.92, max(0.50, bbox.height))
-                )
-            }
+        do {
+            try handler.perform([documentRequest, rectangleRequest])
+        } catch {
+            // Bỏ qua frame lỗi, vẫn tiếp tục kiểm tra nội dung giấy/chữ ở vùng trung tâm
         }
 
-        // Bộ lọc chống nhiễu: phải nhận diện được trang sách liên tiếp ít nhất 3 frame mới xác nhận có sách
+        let quad = bestPageQuad()
+
+        // 3. Xác minh bên trong khung thật sự là trang giấy có chữ in (tránh tự chụp khi chĩa vào bàn/sàn nhà)
+        //    Nếu camera để sát sách (không thấy mép sách), kiểm tra vùng trung tâm khung hình.
+        let centerRegion = CGRect(x: 0.12, y: 0.12, width: 0.76, height: 0.76)
+        let region = quad?.rect ?? centerRegion
+        let metrics = evaluatePageContent(pixelBuffer: pixelBuffer, region: region)
+
+        let hasPaper = metrics.paperLevel >= 80 && metrics.paperRatio >= 0.40
+        let rawBookDetected: Bool
+        let candidateRect: NormalizedBookRect
+        if let quad {
+            let trustedDocument = quad.isDocument && quad.confidence >= 0.8
+            rawBookDetected = hasPaper && (metrics.textTransitions >= 16 || trustedDocument)
+            candidateRect = NormalizedBookRect(
+                x: quad.rect.minX, y: quad.rect.minY, width: quad.rect.width, height: quad.rect.height
+            )
+        } else {
+            // Không thấy mép sách: chỉ chấp nhận khi nền giấy sáng và mật độ chữ rất rõ ràng
+            rawBookDetected = hasPaper && metrics.paperRatio >= 0.55 && metrics.textTransitions >= 30
+            candidateRect = NormalizedBookRect(x: 0.04, y: 0.04, width: 0.92, height: 0.92)
+        }
+
+        // Bộ lọc chống nhiễu: cần 3 frame liên tiếp để xác nhận có sách, mất 3 frame liên tiếp mới coi là mất sách
         if rawBookDetected {
             consecutiveBookDetectedFrames += 1
             consecutiveNoBookFrames = 0
         } else {
             consecutiveNoBookFrames += 1
-            if consecutiveNoBookFrames >= 2 {
+            if consecutiveNoBookFrames >= 3 {
                 consecutiveBookDetectedFrames = 0
             }
         }
@@ -856,10 +885,17 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
         let confirmedBookPresent = consecutiveBookDetectedFrames >= 3
 
         DispatchQueue.main.async {
-            self.isBookDetected = confirmedBookPresent
-            if confirmedBookPresent {
-                self.detectedBookRect = self.detectedBookRect.interpolated(with: candidateRect, alpha: 0.35)
+            if abs(self.previewBufferAspect - bufferAspect) > 0.001 {
+                self.previewBufferAspect = bufferAspect
             }
+            if confirmedBookPresent {
+                if !self.isBookDetected {
+                    self.detectedBookRect = candidateRect
+                } else if rawBookDetected {
+                    self.detectedBookRect = self.detectedBookRect.interpolated(with: candidateRect, alpha: 0.35)
+                }
+            }
+            self.isBookDetected = confirmedBookPresent
 
             guard self.autoCaptureEnabled, !self.isCapturingPhoto else { return }
 
@@ -911,88 +947,148 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
         }
     }
 
-    /// Phân tích kênh độ chói (Y-plane) để:
-    /// 1. Tính độ rung/chuyển động giữa 2 frame liên tiếp (`motionScore`)
-    /// 2. Tính độ khác biệt so với tấm ảnh vừa chụp (`diffFromLastCapture`)
-    /// 3. Kiểm tra xem vùng giữa khung hình có thực sự là trang giấy sáng kèm các dòng chữ in hay không (`hasPaperAndText`)
-    private func analyzeFrameLumaAndBookFeatures(pixelBuffer: CVPixelBuffer) -> (Double, Double, Bool) {
+    /// Khung trang sách tìm được trong frame (tọa độ chuẩn hóa, gốc trên-trái, theo khung hình dọc)
+    private struct DetectedPageQuad {
+        let rect: CGRect
+        let confidence: Float
+        let isDocument: Bool
+    }
+
+    /// Kết quả đo nền giấy & chữ in bên trong một vùng của khung hình
+    private struct PageContentMetrics {
+        let paperLevel: Double      // Độ sáng nền giấy (bách phân vị 70%)
+        let paperRatio: Double      // Tỷ lệ điểm ảnh thuộc nền giấy
+        let textTransitions: Int    // Số lần chuyển từ nền giấy sang nét chữ tối dọc các đường quét
+    }
+
+    /// Chọn khung trang sách tốt nhất: ưu tiên kết quả AI nhận diện tài liệu, sau đó đến hình chữ nhật lớn nhất
+    private func bestPageQuad() -> DetectedPageQuad? {
+        func toTopLeftRect(_ bbox: CGRect) -> CGRect {
+            CGRect(x: bbox.minX, y: 1.0 - bbox.maxY, width: bbox.width, height: bbox.height)
+        }
+
+        if let doc = documentRequest.results?.first,
+           doc.confidence >= 0.5,
+           doc.boundingBox.width * doc.boundingBox.height >= 0.15 {
+            return DetectedPageQuad(rect: toTopLeftRect(doc.boundingBox), confidence: doc.confidence, isDocument: true)
+        }
+
+        let rects = (rectangleRequest.results ?? []).filter {
+            $0.confidence >= 0.5 && $0.boundingBox.width * $0.boundingBox.height >= 0.15
+        }
+        if let largest = rects.max(by: {
+            $0.boundingBox.width * $0.boundingBox.height < $1.boundingBox.width * $1.boundingBox.height
+        }) {
+            return DetectedPageQuad(rect: toTopLeftRect(largest.boundingBox), confidence: largest.confidence, isDocument: false)
+        }
+        return nil
+    }
+
+    /// Kiểm tra vùng `region` (chuẩn hóa, gốc trên-trái) có phải nền giấy sáng kèm các dòng chữ in hay không.
+    /// Ngưỡng được tính tương đối theo độ sáng nền giấy nên hoạt động cả khi ánh sáng yếu.
+    /// Quét cả chiều ngang lẫn chiều dọc vì khi chụp 2 trang (cầm ngang) dòng chữ nằm dọc trong khung hình.
+    private func evaluatePageContent(pixelBuffer: CVPixelBuffer, region: CGRect) -> PageContentMetrics {
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
 
         guard let baseAddr = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0) else {
-            return (1.0, 0.0, false)
+            return PageContentMetrics(paperLevel: 0, paperRatio: 0, textTransitions: 0)
         }
         let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
         let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
         let bytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
         let ptr = baseAddr.assumingMemoryBound(to: UInt8.self)
 
-        let gridW = 36
-        let gridH = 26
-        var currentGrid = [UInt8](repeating: 0, count: gridW * gridH)
+        // Thu nhỏ vùng kiểm tra 8% mỗi cạnh để bỏ qua mép sách, ngón tay và nền bàn
+        let inset = region.insetBy(dx: region.width * 0.08, dy: region.height * 0.08)
+        let x0 = max(0, min(width - 2, Int(inset.minX * CGFloat(width))))
+        let x1 = max(x0 + 1, min(width - 1, Int(inset.maxX * CGFloat(width))))
+        let y0 = max(0, min(height - 2, Int(inset.minY * CGFloat(height))))
+        let y1 = max(y0 + 1, min(height - 1, Int(inset.maxY * CGFloat(height))))
 
-        var leftPageLumaSum = 0
-        var rightPageLumaSum = 0
-        var pageSampleCount = 0
-        var brightPaperSampleCount = 0
+        // Lấy mẫu lưới 24x24 để ước lượng độ sáng nền giấy
+        let samplesPerAxis = 24
+        var samples = [UInt8]()
+        samples.reserveCapacity(samplesPerAxis * samplesPerAxis)
+        for sy in 0..<samplesPerAxis {
+            let py = y0 + ((y1 - y0) * sy) / (samplesPerAxis - 1)
+            let rowPtr = ptr + py * bytesPerRow
+            for sx in 0..<samplesPerAxis {
+                let px = x0 + ((x1 - x0) * sx) / (samplesPerAxis - 1)
+                samples.append(rowPtr[px])
+            }
+        }
+        samples.sort()
+        let paperLevel = Double(samples[(samples.count * 70) / 100])
+        let paperCutoff = UInt8(max(0, min(255, paperLevel * 0.75)))
+        let paperCount = samples.reduce(0) { $0 + ($1 >= paperCutoff ? 1 : 0) }
+        let paperRatio = Double(paperCount) / Double(samples.count)
+
+        // Đếm số lần đi từ nền giấy xuống nét chữ tối trên 6 đường quét mỗi chiều
+        let dropThreshold = max(14, Int(paperLevel * 0.18))
+        let paperFloor = Int(paperLevel * 0.70)
+
+        func countTransitions(along values: (Int) -> Int, length: Int) -> Int {
+            let step = max(1, length / 480)
+            var count = 0
+            var prev = values(0)
+            var i = step
+            while i < length {
+                let cur = values(i)
+                if prev >= paperFloor && prev - cur >= dropThreshold {
+                    count += 1
+                }
+                prev = cur
+                i += step
+            }
+            return count
+        }
+
+        var verticalScanCount = 0
+        var horizontalScanCount = 0
+        for k in 1...6 {
+            let colX = x0 + ((x1 - x0) * k) / 7
+            verticalScanCount += countTransitions(along: { Int(ptr[(y0 + $0) * bytesPerRow + colX]) }, length: y1 - y0)
+
+            let rowY = y0 + ((y1 - y0) * k) / 7
+            let rowPtr = ptr + rowY * bytesPerRow
+            horizontalScanCount += countTransitions(along: { Int(rowPtr[x0 + $0]) }, length: x1 - x0)
+        }
+
+        return PageContentMetrics(
+            paperLevel: paperLevel,
+            paperRatio: paperRatio,
+            textTransitions: max(verticalScanCount, horizontalScanCount)
+        )
+    }
+
+    /// Phân tích kênh độ chói (Y-plane) để:
+    /// 1. Tính độ rung/chuyển động giữa 2 frame liên tiếp (`motionScore`)
+    /// 2. Tính độ khác biệt so với tấm ảnh vừa chụp (`diffFromLastCapture`)
+    private func analyzeFrameMotion(pixelBuffer: CVPixelBuffer) -> (Double, Double) {
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        guard let baseAddr = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0) else {
+            return (1.0, 0.0)
+        }
+        let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
+        let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
+        let bytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+        let ptr = baseAddr.assumingMemoryBound(to: UInt8.self)
+
+        let gridW = 26
+        let gridH = 36
+        var currentGrid = [UInt8](repeating: 0, count: gridW * gridH)
 
         for gy in 0..<gridH {
             let py = min(height - 1, (gy * height) / gridH + (height / (gridH * 2)))
             let rowPtr = ptr + py * bytesPerRow
             for gx in 0..<gridW {
                 let px = min(width - 1, (gx * width) / gridW + (width / (gridW * 2)))
-                let val = rowPtr[px]
-                currentGrid[gy * gridW + gx] = val
-
-                // Vùng trung tâm của 2 trang sách (gx: 5..30, gy: 4..21)
-                if gx >= 5 && gx <= 30 && gy >= 4 && gy <= 21 {
-                    if gx < 18 {
-                        leftPageLumaSum += Int(val)
-                    } else {
-                        rightPageLumaSum += Int(val)
-                    }
-                    pageSampleCount += 1
-                    if val >= 115 {
-                        brightPaperSampleCount += 1
-                    }
-                }
+                currentGrid[gy * gridW + gx] = rowPtr[px]
             }
         }
-
-        // Đếm mật độ tương phản của dòng chữ (Text contrast transitions) trên 8 đường quét ngang trang sách
-        var textEdgeCount = 0
-        let scanCols = [
-            width / 4, width / 3, (width * 2) / 5,
-            (width * 3) / 5, (width * 2) / 3, (width * 3) / 4
-        ]
-        let yStart = height / 5
-        let yEnd = (height * 4) / 5
-        let stepY = max(2, (yEnd - yStart) / 60)
-
-        for colX in scanCols {
-            var prevVal = Int(ptr[yStart * bytesPerRow + colX])
-            var y = yStart + stepY
-            while y < yEnd {
-                let curVal = Int(ptr[y * bytesPerRow + colX])
-                if abs(curVal - prevVal) >= 24 {
-                    textEdgeCount += 1
-                }
-                prevVal = curVal
-                y += stepY
-            }
-        }
-
-        let halfSamples = max(1, pageSampleCount / 2)
-        let leftMean = Double(leftPageLumaSum) / Double(halfSamples)
-        let rightMean = Double(rightPageLumaSum) / Double(halfSamples)
-        let brightRatio = Double(brightPaperSampleCount) / Double(max(1, pageSampleCount))
-
-        // Trang sách hợp lệ: nền giấy đủ sáng, 2 trang cân bằng độ sáng và có ít nhất 14 điểm chuyển tiếp dòng chữ
-        let hasPaperAndText = (leftMean >= 102.0) &&
-                              (rightMean >= 102.0) &&
-                              (abs(leftMean - rightMean) <= 52.0) &&
-                              (brightRatio >= 0.45) &&
-                              (textEdgeCount >= 14)
 
         var motionScore = 1.0
         if previousLumaGrid.count == currentGrid.count {
@@ -1013,7 +1109,7 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
             diffFromLastCapture = Double(capDiff) / Double(currentGrid.count * 255)
         }
 
-        return (motionScore, diffFromLastCapture, hasPaperAndText)
+        return (motionScore, diffFromLastCapture)
     }
 
     func photoOutput(
@@ -1256,7 +1352,7 @@ struct VFlatMainContainerView: View {
     /// - Chỉ sáng viền xanh ngọc và tự đếm chụp khi thực sự nhận diện được trang sách (`isBookDetected == true`)
     private var horizontalBookViewfinderOverlay: some View {
         GeometryReader { viewGeo in
-            let bRect = cameraController.detectedBookRect
+            let bRect = viewfinderBookRect(overlaySize: viewGeo.size, landscape: true)
             let boxWidth = viewGeo.size.width * (cameraController.isBookDetected ? bRect.width : 0.84)
             let boxHeight = viewGeo.size.height * (cameraController.isBookDetected ? bRect.height : 0.78)
             let boxCenterX = viewGeo.size.width * (cameraController.isBookDetected ? (bRect.x + bRect.width / 2.0) : 0.50)
@@ -1371,10 +1467,61 @@ struct VFlatMainContainerView: View {
         }
     }
 
+    /// Quy đổi khung sách từ tọa độ khung hình camera (dọc, gốc trên-trái) sang tọa độ chuẩn hóa của lớp khung ngắm:
+    /// 1. Bù phần ảnh bị cắt do Preview dùng `resizeAspectFill`
+    /// 2. Xoay sang hệ tọa độ ngang khi ở chế độ 2 trang (+90°, hoặc -90° nếu đã lật 180°)
+    /// 3. Bỏ phần màn hình bị Bảng điều khiển (188pt) che
+    private func viewfinderBookRect(overlaySize: CGSize, landscape: Bool) -> NormalizedBookRect {
+        let panelSize: CGFloat = 188
+        let r = cameraController.detectedBookRect
+        let screenW = landscape ? overlaySize.height : overlaySize.width
+        let screenH = landscape ? overlaySize.width + panelSize : overlaySize.height + panelSize
+        guard screenW > 0, screenH > 0 else { return r }
+
+        let screenAspect = screenW / screenH
+        let bufferAspect = max(0.1, cameraController.previewBufferAspect)
+        var sx = r.x, sy = r.y, sw = r.width, sh = r.height
+        if bufferAspect > screenAspect {
+            let k = bufferAspect / screenAspect
+            sx = (r.x - 0.5) * k + 0.5
+            sw = r.width * k
+        } else {
+            let k = screenAspect / bufferAspect
+            sy = (r.y - 0.5) * k + 0.5
+            sh = r.height * k
+        }
+
+        let x: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat
+        let visibleFraction = max(0.1, (screenH - panelSize) / screenH)
+        if landscape {
+            let u = landscapeFlipped180 ? 1.0 - sy - sh : sy
+            let v = landscapeFlipped180 ? sx : 1.0 - sx - sw
+            x = u / visibleFraction
+            w = sh / visibleFraction
+            y = v
+            h = sw
+        } else {
+            x = sx
+            w = sw
+            y = sy / visibleFraction
+            h = sh / visibleFraction
+        }
+
+        // Giới hạn khung trong vùng nhìn thấy
+        let minX = max(0.01, x), minY = max(0.01, y)
+        let maxX = min(0.99, x + w), maxY = min(0.99, y + h)
+        guard maxX - minX > 0.15, maxY - minY > 0.15 else { return .defaultSpread }
+        return NormalizedBookRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+    }
+
     private var singlePagePortraitViewfinderOverlay: some View {
         GeometryReader { viewGeo in
-            let boxW = viewGeo.size.width * 0.82
-            let boxH = viewGeo.size.height * 0.76
+            let bRect = viewfinderBookRect(overlaySize: viewGeo.size, landscape: false)
+            let detected = cameraController.isBookDetected
+            let boxW = viewGeo.size.width * (detected ? bRect.width : 0.82)
+            let boxH = viewGeo.size.height * (detected ? bRect.height : 0.76)
+            let boxCenterX = viewGeo.size.width * (detected ? (bRect.x + bRect.width / 2.0) : 0.50)
+            let boxCenterY = viewGeo.size.height * (detected ? (bRect.y + bRect.height / 2.0) : 0.50)
 
             ZStack {
                 ZStack {
@@ -1411,7 +1558,8 @@ struct VFlatMainContainerView: View {
                         )
                 }
                 .frame(width: boxW, height: boxH)
-                .position(x: viewGeo.size.width / 2.0, y: viewGeo.size.height / 2.0)
+                .position(x: boxCenterX, y: boxCenterY)
+                .animation(.easeOut(duration: 0.15), value: cameraController.isBookDetected)
 
                 VStack {
                     statusBadgeOnViewfinder
