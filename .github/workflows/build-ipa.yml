@@ -1,0 +1,110 @@
+name: Build Unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build-ipa:
+    name: Build BookSplitScanner.ipa on macOS
+    runs-on: macos-15
+
+    steps:
+      - name: 1. Tải mã nguồn từ Repository
+        uses: actions/checkout@v4
+
+      - name: 2. Kiểm tra hoặc tự động tạo cấu hình XcodeGen (project.yml)
+        shell: bash
+        run: |
+          set -e
+          if [ ! -f "project.yml" ]; then
+            echo "Không tìm thấy project.yml, đang tự động tạo project.yml..."
+            cat << 'EOF' > project.yml
+          name: BookSplitScanner
+          options:
+            bundleIdPrefix: com.personal.booksplit
+            deploymentTarget:
+              iOS: "16.0"
+          settings:
+            base:
+              SWIFT_VERSION: "5.9"
+              TARGETED_DEVICE_FAMILY: "1,2"
+              IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+              MARKETING_VERSION: "1.0.0"
+              CURRENT_PROJECT_VERSION: "1"
+          targets:
+            BookSplitScanner:
+              type: application
+              platform: iOS
+              deploymentTarget: "16.0"
+              sources:
+                - path: .
+                  includes:
+                    - "**/*.swift"
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.personal.booksplit.scanner
+                  INFOPLIST_FILE: Info.plist
+                  GENERATE_INFOPLIST_FILE: NO
+              info:
+                path: Info.plist
+                properties:
+                  CFBundleDisplayName: "BookSplit"
+                  CFBundleName: "BookSplitScanner"
+                  CFBundleIdentifier: "$(PRODUCT_BUNDLE_IDENTIFIER)"
+                  CFBundleExecutable: "$(EXECUTABLE_NAME)"
+                  CFBundlePackageType: "$(PRODUCT_BUNDLE_PACKAGE_TYPE)"
+                  CFBundleShortVersionString: "1.0.0"
+                  CFBundleVersion: "1"
+                  LSRequiresIPhoneOS: true
+                  UIApplicationSceneManifest:
+                    UIApplicationSupportsMultipleScenes: false
+                  UILaunchScreen: {}
+                  NSCameraUsageDescription: "Ứng dụng cần quyền truy cập Camera sắc nét của iPhone để quét và tự động tách 2 trang sách."
+                  NSPhotoLibraryUsageDescription: "Ứng dụng cần quyền truy cập Thư viện ảnh để nhập ảnh trang sách và tách trang tự động."
+                  NSPhotoLibraryAddUsageDescription: "Ứng dụng cần quyền lưu ảnh trang sách đã tách vào Thư viện ảnh."
+                  UISupportedInterfaceOrientations:
+                    - UIInterfaceOrientationPortrait
+                    - UIInterfaceOrientationLandscapeLeft
+                    - UIInterfaceOrientationLandscapeRight
+                  UISupportedInterfaceOrientations~ipad:
+                    - UIInterfaceOrientationPortrait
+                    - UIInterfaceOrientationPortraitUpsideDown
+                    - UIInterfaceOrientationLandscapeLeft
+                    - UIInterfaceOrientationLandscapeRight
+          EOF
+          fi
+
+      - name: 3. Cài đặt XcodeGen và khởi tạo dự án Xcode (.xcodeproj)
+        shell: bash
+        run: |
+          if ! command -v xcodegen &> /dev/null; then
+            brew install xcodegen
+          fi
+          xcodegen generate
+
+      - name: 4. Biên dịch ứng dụng iOS (Release - Unsigned)
+        shell: bash
+        run: |
+          xcodebuild clean build             -project BookSplitScanner.xcodeproj             -scheme BookSplitScanner             -configuration Release             -sdk iphoneos             -derivedDataPath build_output             CODE_SIGN_IDENTITY=""             CODE_SIGNING_REQUIRED=NO             CODE_SIGNING_ALLOWED=NO             AD_HOC_CODE_SIGNING_ALLOWED=YES
+
+      - name: 5. Ký Ad-Hoc và đóng gói thành file BookSplitScanner.ipa
+        shell: bash
+        run: |
+          rm -rf Payload BookSplitScanner.ipa
+          mkdir -p Payload
+          APP_PATH=$(find build_output -name "BookSplitScanner.app" -type d | head -n 1)
+          echo "Found built app at: $APP_PATH"
+          cp -R "$APP_PATH" Payload/
+          codesign --force --deep --sign - Payload/BookSplitScanner.app
+          zip -r9 BookSplitScanner.ipa Payload
+
+      - name: 6. Tải file BookSplitScanner.ipa lên mục Artifacts để tải về
+        uses: actions/upload-artifact@v4
+        with:
+          name: BookSplitScanner-IPA
+          path: BookSplitScanner.ipa
+          retention-days: 30
