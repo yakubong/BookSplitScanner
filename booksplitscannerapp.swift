@@ -8,7 +8,7 @@ import PhotosUI
 import UIKit
 
 // MARK: - App Version Constant (Tự động đọc bởi GitHub Actions để đặt tên file .ipa)
-let APP_VERSION = "2.0.0"
+let APP_VERSION = "2.1.0"
 
 enum AppVersionHelper {
     static var displayString: String {
@@ -67,10 +67,10 @@ enum RescanMode: Equatable {
 
 enum AutoCaptureStatus: Equatable {
     case manualOnly
-    case searchingBook
-    case stabilizing(progress: CGFloat) // 0.0 -> 1.0 (Teal fill sweeping up like vFlat)
+    case noBookDetected
+    case stabilizing(progress: CGFloat) // 0.0 -> 1.0 (Teal fill sweeping up when book is detected & still)
     case capturing
-    case waitingForPageTurn // Sau khi chụp xong 1 lượt, chờ người dùng lật trang mới chụp tiếp
+    case waitingForPageTurn // Sau khi chụp xong 1 lượt, chờ người dùng lật sang trang mới
 }
 
 struct ScannedBookPage: Identifiable, Equatable {
@@ -124,37 +124,21 @@ struct ScannedBookPage: Identifiable, Equatable {
     }
 }
 
-/// Tọa độ 4 đỉnh khung trang sách đã chuẩn hóa [0...1] trong hệ tọa độ hiển thị
-struct NormalizedQuad: Equatable {
-    var topLeft: CGPoint
-    var topRight: CGPoint
-    var bottomRight: CGPoint
-    var bottomLeft: CGPoint
+/// Khung chữ nhật chuẩn hóa [0...1] trong hệ tọa độ ngang của sách
+struct NormalizedBookRect: Equatable {
+    var x: CGFloat
+    var y: CGFloat
+    var width: CGFloat
+    var height: CGFloat
 
-    static let defaultBookSpread = NormalizedQuad(
-        topLeft: CGPoint(x: 0.08, y: 0.12),
-        topRight: CGPoint(x: 0.92, y: 0.12),
-        bottomRight: CGPoint(x: 0.92, y: 0.88),
-        bottomLeft: CGPoint(x: 0.08, y: 0.88)
-    )
+    static let defaultSpread = NormalizedBookRect(x: 0.07, y: 0.10, width: 0.86, height: 0.80)
 
-    var boundingRect: CGRect {
-        let minX = min(topLeft.x, bottomLeft.x)
-        let maxX = max(topRight.x, bottomRight.x)
-        let minY = min(topLeft.y, topRight.y)
-        let maxY = max(bottomLeft.y, bottomRight.y)
-        return CGRect(x: minX, y: minY, width: max(0.1, maxX - minX), height: max(0.1, maxY - minY))
-    }
-
-    func interpolated(with other: NormalizedQuad, alpha: CGFloat) -> NormalizedQuad {
-        func lerp(_ a: CGPoint, _ b: CGPoint) -> CGPoint {
-            CGPoint(x: a.x + (b.x - a.x) * alpha, y: a.y + (b.y - a.y) * alpha)
-        }
-        return NormalizedQuad(
-            topLeft: lerp(topLeft, other.topLeft),
-            topRight: lerp(topRight, other.topRight),
-            bottomRight: lerp(bottomRight, other.bottomRight),
-            bottomLeft: lerp(bottomLeft, other.bottomLeft)
+    func interpolated(with target: NormalizedBookRect, alpha: CGFloat) -> NormalizedBookRect {
+        NormalizedBookRect(
+            x: x + (target.x - x) * alpha,
+            y: y + (target.y - y) * alpha,
+            width: width + (target.width - width) * alpha,
+            height: height + (target.height - height) * alpha
         )
     }
 }
@@ -180,13 +164,18 @@ final class BookSpineProcessor {
         }
     }
 
-    /// Đảm bảo ảnh trang đôi luôn xoay nằm ngang trước khi cắt đôi
-    func ensureLandscapeSpread(_ image: UIImage, isTwoPageMode: Bool) -> UIImage {
+    /// Đảm bảo ảnh trang đôi luôn xoay nằm ngang đúng chiều đọc (Notch bên trái -> xoay ngược chiều kim đồng hồ 90°)
+    func ensureLandscapeSpread(_ image: UIImage, isTwoPageMode: Bool, landscapeFlipped180: Bool = false) -> UIImage {
         let normalized = normalizeOrientation(image)
-        guard isTwoPageMode, normalized.size.height > normalized.size.width * 1.05 else {
-            return normalized
+        guard isTwoPageMode else { return normalized }
+        if normalized.size.height > normalized.size.width * 1.02 {
+            // Khi khóa màn hình dọc và cầm ngang máy (Notch bên trái), đỉnh ảnh nằm bên trái sách -> xoay 90° ngược chiều kim đồng hồ
+            return rotate90Degrees(normalized, clockwise: landscapeFlipped180)
+        } else if landscapeFlipped180 {
+            let r1 = rotate90Degrees(normalized, clockwise: true)
+            return rotate90Degrees(r1, clockwise: true)
         }
-        return rotate90Degrees(normalized, clockwise: false)
+        return normalized
     }
 
     func rotate90Degrees(_ image: UIImage, clockwise: Bool) -> UIImage {
@@ -217,8 +206,8 @@ final class BookSpineProcessor {
         let request = VNDetectRectanglesRequest()
         request.minimumAspectRatio = 0.45
         request.maximumAspectRatio = 2.2
-        request.minimumSize = 0.42
-        request.minimumConfidence = 0.65
+        request.minimumSize = 0.38
+        request.minimumConfidence = 0.68
         request.maximumObservations = 1
 
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
@@ -335,7 +324,6 @@ final class BookSpineProcessor {
         let size = CGSize(width: width, height: height)
         let renderer = UIGraphicsImageRenderer(size: size, format: format)
 
-        // Tô viền giấy trắng sạch mỏng (1.8%) ở 3 cạnh ngoài để che vết ngón tay bấm sát mép sách
         return renderer.image { ctx in
             normalized.draw(in: CGRect(origin: .zero, size: size))
             let cgCtx = ctx.cgContext
@@ -371,7 +359,6 @@ final class BookSpineProcessor {
             return working
 
         case .cleanBook:
-            // Kéo sáng vùng bóng râm ở rãnh gáy sách
             let shadowHighlight = CIFilter.highlightShadowAdjust()
             shadowHighlight.inputImage = outputCI
             shadowHighlight.shadowAmount = 0.68
@@ -380,7 +367,6 @@ final class BookSpineProcessor {
                 outputCI = shOut
             }
 
-            // Tăng độ tương phản chữ và làm trắng nền giấy ngả vàng
             let colorControls = CIFilter.colorControls()
             colorControls.inputImage = outputCI
             colorControls.contrast = 1.34
@@ -390,7 +376,6 @@ final class BookSpineProcessor {
                 outputCI = ccOut
             }
 
-            // Làm nét chữ in
             let unsharp = CIFilter.unsharpMask()
             unsharp.inputImage = outputCI
             unsharp.radius = 1.75
@@ -436,12 +421,18 @@ final class BookSpineProcessor {
         readingDirection: ReadingDirection,
         enhancement: EnhancementFilter,
         gutterTrimRatio: CGFloat = 0.015,
-        removeFingers: Bool = true
+        removeFingers: Bool = true,
+        landscapeFlipped180: Bool = false
     ) -> [ScannedBookPage] {
         return autoreleasepool {
             let groupID = UUID()
-            let flattened = autoCropAndFlattenBook(rawShot)
-            let spreadImage = ensureLandscapeSpread(flattened, isTwoPageMode: twoPageMode)
+            // Xoay ngang ảnh theo đúng hướng cầm ngang của chế độ 2 trang trước khi cắt phẳng & tách đôi
+            let orientedRaw = ensureLandscapeSpread(
+                rawShot,
+                isTwoPageMode: twoPageMode,
+                landscapeFlipped180: landscapeFlipped180
+            )
+            let spreadImage = autoCropAndFlattenBook(orientedRaw)
             guard let cgImage = spreadImage.cgImage else { return [] }
 
             let width = CGFloat(cgImage.width)
@@ -607,7 +598,7 @@ final class BookSpineProcessor {
         }
     }
 
-    /// Xuất PDF (hỗ trợ đính kèm lớp văn bản OCR để tìm kiếm/copy chữ trong PDF)
+    /// Xuất PDF chất lượng cao
     func generatePDF(from pages: [ScannedBookPage], fileName: String) -> URL? {
         guard !pages.isEmpty else { return nil }
         let safeName = fileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -640,26 +631,26 @@ final class BookSpineProcessor {
     }
 }
 
-// MARK: - vFlat Real-Time Camera & "No-Tapping" Auto-Capture Controller
+// MARK: - vFlat Real-Time Camera & Strict Book-Detection Auto-Capture Controller
 
 final class VFlatCameraController: NSObject, ObservableObject {
-    @Published var detectedQuad: NormalizedQuad = .defaultBookSpread
-    @Published var isBookDetected: Bool = true
+    @Published var detectedBookRect: NormalizedBookRect = .defaultSpread
+    @Published var isBookDetected: Bool = false
     @Published var autoCaptureEnabled: Bool = true {
         didSet {
             if !autoCaptureEnabled {
                 autoStatus = .manualOnly
                 autoFillProgress = 0.0
             } else {
-                autoStatus = .searchingBook
+                autoStatus = isBookDetected ? .stabilizing(progress: 0) : .noBookDetected
                 autoFillProgress = 0.0
             }
         }
     }
     @Published var autoFillProgress: CGFloat = 0.0
-    @Published var autoStatus: AutoCaptureStatus = .searchingBook
+    @Published var autoStatus: AutoCaptureStatus = .noBookDetected
     @Published var isTorchOn: Bool = false
-    @Published var holdDurationSeconds: Double = 1.15
+    @Published var holdDurationSeconds: Double = 1.2
     @Published var shutterFlashTrigger: Bool = false
     @Published var cameraPermissionDenied: Bool = false
 
@@ -672,8 +663,11 @@ final class VFlatCameraController: NSObject, ObservableObject {
     var onPhotoCaptured: ((UIImage) -> Void)?
 
     private var previousLumaGrid: [UInt8] = []
+    private var lastCapturedLumaGrid: [UInt8] = []
     private var lastFrameTimestamp: CFTimeInterval = 0
     private var stableElapsedSeconds: Double = 0
+    private var consecutiveBookDetectedFrames: Int = 0
+    private var consecutiveNoBookFrames: Int = 0
     private var pageTurnMotionFrames: Int = 0
     private var isCapturingPhoto: Bool = false
     private var isSessionConfigured: Bool = false
@@ -762,6 +756,7 @@ final class VFlatCameraController: NSObject, ObservableObject {
     func triggerManualCapture() {
         guard !isCapturingPhoto else { return }
         isCapturingPhoto = true
+        lastCapturedLumaGrid = previousLumaGrid
         let feedback = UIImpactFeedbackGenerator(style: .medium)
         feedback.impactOccurred()
 
@@ -779,18 +774,22 @@ final class VFlatCameraController: NSObject, ObservableObject {
         sessionQueue.async {
             let settings = AVCapturePhotoSettings()
             settings.isHighResolutionPhotoEnabled = true
+            if let conn = self.photoOutput.connection(with: .video),
+               conn.isVideoOrientationSupported {
+                conn.videoOrientation = .portrait
+            }
             self.photoOutput.capturePhoto(with: settings, delegate: self)
         }
     }
 
-    /// Đặt lại trạng thái chờ lật trang để sẵn sàng chụp ngay lập tức (khi vào chế độ Rescan)
     func armImmediateCapture() {
         videoOutputQueue.async {
             self.stableElapsedSeconds = 0
             self.pageTurnMotionFrames = 0
+            self.lastCapturedLumaGrid = []
             DispatchQueue.main.async {
                 if self.autoCaptureEnabled {
-                    self.autoStatus = .searchingBook
+                    self.autoStatus = self.isBookDetected ? .stabilizing(progress: 0) : .noBookDetected
                     self.autoFillProgress = 0
                 }
             }
@@ -805,61 +804,93 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
         from connection: AVCaptureConnection
     ) {
         let now = CACurrentMediaTime()
-        // Phân tích ~10 khung hình/giây để tiết kiệm pin và mượt máy
         guard now - lastFrameTimestamp >= 0.095 else { return }
         let dt = lastFrameTimestamp == 0 ? 0.1 : min(0.35, now - lastFrameTimestamp)
         lastFrameTimestamp = now
 
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
-        // 1. Đo chuyển động khung hình (Motion Delta) trên lưới 32x24 điểm ảnh độ chói (Y-plane)
-        let motionScore = computeFrameMotion(pixelBuffer: pixelBuffer)
+        // 1. Đo chuyển động khung hình + kiểm tra đặc trưng giấy & dòng chữ thực sự trên trang sách
+        let (motionScore, diffFromLastCapture, hasPaperAndTextFeatures) = analyzeFrameLumaAndBookFeatures(pixelBuffer: pixelBuffer)
 
-        // 2. Phát hiện 4 góc trang sách bằng Vision
+        // 2. Phát hiện biên dạng 4 cạnh trang sách bằng Apple Vision (VNDetectRectanglesRequest)
         let rectRequest = VNDetectRectanglesRequest()
         rectRequest.minimumAspectRatio = 0.45
-        rectRequest.maximumAspectRatio = 2.2
-        rectRequest.minimumSize = 0.35
-        rectRequest.minimumConfidence = 0.55
+        rectRequest.maximumAspectRatio = 2.1
+        rectRequest.minimumSize = 0.36
+        rectRequest.minimumConfidence = 0.65
         rectRequest.maximumObservations = 1
 
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
         try? handler.perform([rectRequest])
 
-        var newQuad: NormalizedQuad = .defaultBookSpread
-        var foundBook = true
+        var rawBookDetected = false
+        var candidateRect = NormalizedBookRect.defaultSpread
+
         if let obs = rectRequest.results?.first {
-            newQuad = NormalizedQuad(
-                topLeft: CGPoint(x: obs.topLeft.x, y: 1.0 - obs.topLeft.y),
-                topRight: CGPoint(x: obs.topRight.x, y: 1.0 - obs.topRight.y),
-                bottomRight: CGPoint(x: obs.bottomRight.x, y: 1.0 - obs.bottomRight.y),
-                bottomLeft: CGPoint(x: obs.bottomLeft.x, y: 1.0 - obs.bottomLeft.y)
-            )
-            foundBook = true
+            let bbox = obs.boundingBox
+            let area = bbox.width * bbox.height
+            // Trang sách phải chiếm ít nhất 26% diện tích khung hình VÀ bên trong phải có nền giấy sáng + mật độ dòng chữ in
+            if area >= 0.26 && obs.confidence >= 0.65 && hasPaperAndTextFeatures {
+                rawBookDetected = true
+                candidateRect = NormalizedBookRect(
+                    x: max(0.03, min(0.25, bbox.minX)),
+                    y: max(0.04, min(0.25, 1.0 - bbox.maxY)),
+                    width: min(0.94, max(0.50, bbox.width)),
+                    height: min(0.92, max(0.50, bbox.height))
+                )
+            }
         }
 
+        // Bộ lọc chống nhiễu: phải nhận diện được trang sách liên tiếp ít nhất 3 frame mới xác nhận có sách
+        if rawBookDetected {
+            consecutiveBookDetectedFrames += 1
+            consecutiveNoBookFrames = 0
+        } else {
+            consecutiveNoBookFrames += 1
+            if consecutiveNoBookFrames >= 2 {
+                consecutiveBookDetectedFrames = 0
+            }
+        }
+
+        let confirmedBookPresent = consecutiveBookDetectedFrames >= 3
+
         DispatchQueue.main.async {
-            self.isBookDetected = foundBook
-            self.detectedQuad = self.detectedQuad.interpolated(with: newQuad, alpha: 0.35)
+            self.isBookDetected = confirmedBookPresent
+            if confirmedBookPresent {
+                self.detectedBookRect = self.detectedBookRect.interpolated(with: candidateRect, alpha: 0.35)
+            }
 
             guard self.autoCaptureEnabled, !self.isCapturingPhoto else { return }
 
-            // Máy trạng thái Auto-Capture không cần chạm tay (giống hệt vFlat):
-            // Sau khi chụp xong 1 trang đôi, chờ người dùng lật trang (motionScore > 0.036)
-            if self.autoStatus == .waitingForPageTurn {
-                if motionScore > 0.034 {
+            // QUAN TRỌNG: Nếu KHÔNG nhận diện được trang sách -> Tuyệt đối không tự chụp, đưa thanh đếm về 0% ngay lập tức!
+            if !confirmedBookPresent {
+                self.stableElapsedSeconds = 0
+                self.autoFillProgress = 0.0
+                if self.autoStatus != .waitingForPageTurn {
+                    self.autoStatus = .noBookDetected
+                } else if motionScore > 0.038 {
                     self.pageTurnMotionFrames += 1
-                    if self.pageTurnMotionFrames >= 2 {
-                        self.stableElapsedSeconds = 0
-                        self.autoFillProgress = 0
-                        self.autoStatus = .searchingBook
-                    }
                 }
                 return
             }
 
-            // Khi trang sách đứng yên (motionScore < 0.017), thanh màu xanh ngọc dâng dần từ 0% -> 100%
-            if motionScore < 0.017 {
+            // Nếu vừa chụp xong 1 trang đôi, bắt buộc chờ người dùng lật sang trang mới
+            // (phải có chuyển động lật trang VÀ nội dung trang mới khác trang vừa chụp)
+            if self.autoStatus == .waitingForPageTurn {
+                if motionScore > 0.034 {
+                    self.pageTurnMotionFrames += 1
+                }
+                if self.pageTurnMotionFrames >= 2 && diffFromLastCapture > 0.025 && motionScore < 0.018 {
+                    self.stableElapsedSeconds = 0
+                    self.autoFillProgress = 0
+                    self.autoStatus = .stabilizing(progress: 0)
+                }
+                return
+            }
+
+            // Chỉ khi ĐÃ NHẬN DIỆN ĐƯỢC TRANG SÁCH + giữ máy/sách đứng yên (motionScore < 0.015) mới tăng thanh xanh ngọc
+            if motionScore < 0.015 {
                 self.stableElapsedSeconds += dt
                 let progress = min(1.0, max(0.0, CGFloat(self.stableElapsedSeconds / self.holdDurationSeconds)))
                 self.autoFillProgress = progress
@@ -871,46 +902,118 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
                     self.triggerManualCapture()
                 }
             } else {
-                // Nếu tay đang lật sách hoặc máy rung, tự động hạ thanh đếm về 0
-                self.stableElapsedSeconds = max(0.0, self.stableElapsedSeconds - dt * 2.2)
+                // Nếu tay đang di chuyển hoặc lật sách, hạ thanh đếm về 0
+                self.stableElapsedSeconds = max(0.0, self.stableElapsedSeconds - dt * 2.8)
                 let progress = min(1.0, max(0.0, CGFloat(self.stableElapsedSeconds / self.holdDurationSeconds)))
                 self.autoFillProgress = progress
-                self.autoStatus = progress > 0.05 ? .stabilizing(progress: progress) : .searchingBook
+                self.autoStatus = .stabilizing(progress: progress)
             }
         }
     }
 
-    private func computeFrameMotion(pixelBuffer: CVPixelBuffer) -> Double {
+    /// Phân tích kênh độ chói (Y-plane) để:
+    /// 1. Tính độ rung/chuyển động giữa 2 frame liên tiếp (`motionScore`)
+    /// 2. Tính độ khác biệt so với tấm ảnh vừa chụp (`diffFromLastCapture`)
+    /// 3. Kiểm tra xem vùng giữa khung hình có thực sự là trang giấy sáng kèm các dòng chữ in hay không (`hasPaperAndText`)
+    private func analyzeFrameLumaAndBookFeatures(pixelBuffer: CVPixelBuffer) -> (Double, Double, Bool) {
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
 
-        guard let baseAddr = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0) else { return 0.0 }
+        guard let baseAddr = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0) else {
+            return (1.0, 0.0, false)
+        }
         let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
         let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
         let bytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
         let ptr = baseAddr.assumingMemoryBound(to: UInt8.self)
 
-        let gridW = 32
-        let gridH = 24
+        let gridW = 36
+        let gridH = 26
         var currentGrid = [UInt8](repeating: 0, count: gridW * gridH)
+
+        var leftPageLumaSum = 0
+        var rightPageLumaSum = 0
+        var pageSampleCount = 0
+        var brightPaperSampleCount = 0
 
         for gy in 0..<gridH {
             let py = min(height - 1, (gy * height) / gridH + (height / (gridH * 2)))
             let rowPtr = ptr + py * bytesPerRow
             for gx in 0..<gridW {
                 let px = min(width - 1, (gx * width) / gridW + (width / (gridW * 2)))
-                currentGrid[gy * gridW + gx] = rowPtr[px]
+                let val = rowPtr[px]
+                currentGrid[gy * gridW + gx] = val
+
+                // Vùng trung tâm của 2 trang sách (gx: 5..30, gy: 4..21)
+                if gx >= 5 && gx <= 30 && gy >= 4 && gy <= 21 {
+                    if gx < 18 {
+                        leftPageLumaSum += Int(val)
+                    } else {
+                        rightPageLumaSum += Int(val)
+                    }
+                    pageSampleCount += 1
+                    if val >= 115 {
+                        brightPaperSampleCount += 1
+                    }
+                }
             }
         }
 
-        defer { previousLumaGrid = currentGrid }
-        guard previousLumaGrid.count == currentGrid.count else { return 1.0 }
+        // Đếm mật độ tương phản của dòng chữ (Text contrast transitions) trên 8 đường quét ngang trang sách
+        var textEdgeCount = 0
+        let scanCols = [
+            width / 4, width / 3, (width * 2) / 5,
+            (width * 3) / 5, (width * 2) / 3, (width * 3) / 4
+        ]
+        let yStart = height / 5
+        let yEnd = (height * 4) / 5
+        let stepY = max(2, (yEnd - yStart) / 60)
 
-        var diffSum = 0
-        for i in 0..<currentGrid.count {
-            diffSum += abs(Int(currentGrid[i]) - Int(previousLumaGrid[i]))
+        for colX in scanCols {
+            var prevVal = Int(ptr[yStart * bytesPerRow + colX])
+            var y = yStart + stepY
+            while y < yEnd {
+                let curVal = Int(ptr[y * bytesPerRow + colX])
+                if abs(curVal - prevVal) >= 24 {
+                    textEdgeCount += 1
+                }
+                prevVal = curVal
+                y += stepY
+            }
         }
-        return Double(diffSum) / Double(currentGrid.count * 255)
+
+        let halfSamples = max(1, pageSampleCount / 2)
+        let leftMean = Double(leftPageLumaSum) / Double(halfSamples)
+        let rightMean = Double(rightPageLumaSum) / Double(halfSamples)
+        let brightRatio = Double(brightPaperSampleCount) / Double(max(1, pageSampleCount))
+
+        // Trang sách hợp lệ: nền giấy đủ sáng, 2 trang cân bằng độ sáng và có ít nhất 14 điểm chuyển tiếp dòng chữ
+        let hasPaperAndText = (leftMean >= 102.0) &&
+                              (rightMean >= 102.0) &&
+                              (abs(leftMean - rightMean) <= 52.0) &&
+                              (brightRatio >= 0.45) &&
+                              (textEdgeCount >= 14)
+
+        var motionScore = 1.0
+        if previousLumaGrid.count == currentGrid.count {
+            var diffSum = 0
+            for i in 0..<currentGrid.count {
+                diffSum += abs(Int(currentGrid[i]) - Int(previousLumaGrid[i]))
+            }
+            motionScore = Double(diffSum) / Double(currentGrid.count * 255)
+        }
+        previousLumaGrid = currentGrid
+
+        var diffFromLastCapture = 1.0
+        if lastCapturedLumaGrid.count == currentGrid.count {
+            var capDiff = 0
+            for i in 0..<currentGrid.count {
+                capDiff += abs(Int(currentGrid[i]) - Int(lastCapturedLumaGrid[i]))
+            }
+            diffFromLastCapture = Double(capDiff) / Double(currentGrid.count * 255)
+        }
+
+        return (motionScore, diffFromLastCapture, hasPaperAndText)
     }
 
     func photoOutput(
@@ -937,7 +1040,7 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
     }
 }
 
-// MARK: - Live Camera Preview Layer
+// MARK: - Live Camera Preview Layer (Khóa cố định Portrait để không bao giờ bị xoay nhầm bởi cảm biến iPhone)
 
 struct CameraPreviewLayerView: UIViewRepresentable {
     let session: AVCaptureSession
@@ -951,7 +1054,7 @@ struct CameraPreviewLayerView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: PreviewUIView, context: Context) {
-        uiView.updateOrientation()
+        uiView.lockPortraitOrientation()
     }
 
     final class PreviewUIView: UIView {
@@ -960,26 +1063,14 @@ struct CameraPreviewLayerView: UIViewRepresentable {
 
         override func layoutSubviews() {
             super.layoutSubviews()
-            updateOrientation()
+            lockPortraitOrientation()
         }
 
-        func updateOrientation() {
+        func lockPortraitOrientation() {
             guard let connection = videoPreviewLayer.connection,
                   connection.isVideoOrientationSupported else { return }
-            let deviceOrientation = UIDevice.current.orientation
-            switch deviceOrientation {
-            case .landscapeLeft:
-                connection.videoOrientation = .landscapeRight
-            case .landscapeRight:
-                connection.videoOrientation = .landscapeLeft
-            case .portraitUpsideDown:
-                connection.videoOrientation = .portraitUpsideDown
-            default:
-                if bounds.width > bounds.height {
-                    connection.videoOrientation = .landscapeRight
-                } else {
-                    connection.videoOrientation = .portrait
-                }
+            if connection.videoOrientation != .portrait {
+                connection.videoOrientation = .portrait
             }
         }
     }
@@ -995,13 +1086,14 @@ struct ActivityShareSheet: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
-// MARK: - Root Container (Switches seamlessly between vFlat Camera & Library Grid)
+// MARK: - Root Container
 
 struct VFlatMainContainerView: View {
     @StateObject private var cameraController = VFlatCameraController()
 
     @State private var pages: [ScannedBookPage] = []
     @State private var twoPageMode: Bool = true
+    @State private var landscapeFlipped180: Bool = false
     @State private var readingDirection: ReadingDirection = .leftToRight
     @State private var enhancementFilter: EnhancementFilter = .cleanBook
     @State private var removeFingersAtEdges: Bool = true
@@ -1048,22 +1140,7 @@ struct VFlatMainContainerView: View {
                     }
                 )
             } else {
-                vFlatLiveCameraScreen
-            }
-
-            if let toast = statusToastText {
-                VStack {
-                    Text(toast)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 9)
-                        .background(Color.black.opacity(0.75))
-                        .clipShape(Capsule())
-                        .padding(.top, 16)
-                    Spacer()
-                }
-                .transition(.opacity)
+                vFlatOrientationLockedCameraScreen
             }
         }
         .fullScreenCover(item: Binding(
@@ -1118,50 +1195,78 @@ struct VFlatMainContainerView: View {
         }
     }
 
-    // MARK: - 1. Màn hình Camera Trực Tiếp Chuẩn Giao Diện vFlat (Giống Ảnh 1 & Ảnh 2)
+    // MARK: - 1. Màn hình Camera Khóa Cố Định Chiều Ngang Khi Quét 2 Trang (Không bị ảnh hưởng bởi Tự Xoay của iPhone)
 
-    private var vFlatLiveCameraScreen: some View {
-        GeometryReader { geo in
-            let isLandscape = geo.size.width > geo.size.height
+    private var vFlatOrientationLockedCameraScreen: some View {
+        GeometryReader { fullGeo in
+            let W = fullGeo.size.width
+            let H = fullGeo.size.height
 
-            if isLandscape {
-                HStack(spacing: 0) {
-                    cameraViewfinderArea
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    vFlatCameraControlPanel(isLandscape: true)
-                        .frame(width: 195)
-                        .background(Color.white)
+            ZStack {
+                // Lớp 1: Camera Preview gốc cố định trên toàn màn hình
+                CameraPreviewLayerView(session: cameraController.session)
+                    .ignoresSafeArea()
+
+                // Lớp 2: Giao diện điều khiển & Khung [1 | 2]
+                // Khi ở chế độ 2 Trang (`twoPageMode == true`), giao diện tự động xoay ngang 90° cố định
+                // (Tai thỏ ở bên trái, Bảng điều khiển ở bên phải, vạch đứt nét cắt dọc đúng giữa gáy sách!)
+                if twoPageMode {
+                    let landscapeW = H
+                    let landscapeH = W
+                    let rotationAngle: Angle = landscapeFlipped180 ? .degrees(-90) : .degrees(90)
+
+                    HStack(spacing: 0) {
+                        horizontalBookViewfinderOverlay
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                        vFlatLandscapeRightControlPanel
+                            .frame(width: 188)
+                            .background(Color.white)
+                    }
+                    .frame(width: landscapeW, height: landscapeH)
+                    .rotationEffect(rotationAngle)
+                    .position(x: W / 2.0, y: H / 2.0)
+                } else {
+                    // Khi ở chế độ 1 Trang đơn (`twoPageMode == false`), hiển thị dọc theo trang đơn
+                    VStack(spacing: 0) {
+                        singlePagePortraitViewfinderOverlay
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                        vFlatPortraitBottomControlPanel
+                            .frame(height: 188)
+                            .background(Color.white)
+                    }
+                    .frame(width: W, height: H)
                 }
-                .ignoresSafeArea()
-            } else {
-                VStack(spacing: 0) {
-                    cameraViewfinderArea
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    vFlatCameraControlPanel(isLandscape: false)
-                        .frame(height: 195)
-                        .background(Color.white)
+
+                // Hiệu ứng chớp màn trập khi chụp
+                if cameraController.shutterFlashTrigger {
+                    Color.white.opacity(0.65)
+                        .ignoresSafeArea()
                 }
-                .ignoresSafeArea()
             }
+            .ignoresSafeArea()
         }
+        .ignoresSafeArea()
     }
 
-    private var cameraViewfinderArea: some View {
+    /// Giao diện kính ngắm nằm ngang chuẩn cho 2 trang sách:
+    /// - Vạch đứt nét chạy DỌC từ cạnh trên xuống cạnh dưới màn hình ngang (cắt đúng gáy sách)
+    /// - Số 1 nằm bên Trang Trái, Số 2 nằm bên Trang Phải, đứng thẳng đúng chiều người đọc
+    /// - Chỉ sáng viền xanh ngọc và tự đếm chụp khi thực sự nhận diện được trang sách (`isBookDetected == true`)
+    private var horizontalBookViewfinderOverlay: some View {
         GeometryReader { viewGeo in
+            let bRect = cameraController.detectedBookRect
+            let boxWidth = viewGeo.size.width * (cameraController.isBookDetected ? bRect.width : 0.84)
+            let boxHeight = viewGeo.size.height * (cameraController.isBookDetected ? bRect.height : 0.78)
+            let boxCenterX = viewGeo.size.width * (cameraController.isBookDetected ? (bRect.x + bRect.width / 2.0) : 0.50)
+            let boxCenterY = viewGeo.size.height * (cameraController.isBookDetected ? (bRect.y + bRect.height / 2.0) : 0.50)
+
             ZStack {
-                CameraPreviewLayerView(session: cameraController.session)
-
-                // Khung xanh ngọc nhận diện 2 trang sách + đường đứt nét gáy sách + Số 1 | 2 giống hệt vFlat
-                let boxRect = CGRect(
-                    x: viewGeo.size.width * 0.08,
-                    y: viewGeo.size.height * 0.11,
-                    width: viewGeo.size.width * 0.84,
-                    height: viewGeo.size.height * 0.78
-                )
-
+                // Khung 2 trang sách [1 | 2]
                 ZStack {
-                    // Lớp màu xanh ngọc dâng từ dưới lên khi Auto-Capture đang đếm (Giống Ảnh 2)
-                    if cameraController.autoFillProgress > 0.01 {
+                    // Thanh màu xanh ngọc dâng từ đáy sách lên đỉnh sách khi nhận diện được sách & giữ yên
+                    if cameraController.isBookDetected && cameraController.autoFillProgress > 0.01 {
                         GeometryReader { boxGeo in
                             let fillH = boxGeo.size.height * cameraController.autoFillProgress
                             Rectangle()
@@ -1174,47 +1279,58 @@ struct VFlatMainContainerView: View {
                         }
                     }
 
-                    // Viền xanh ngọc bao quanh 2 trang sách
-                    RoundedRectangle(cornerRadius: 4)
-                        .stroke(vFlatTeal, lineWidth: 3.2)
-
-                    if twoPageMode {
-                        // Đường đứt nét trắng dọc theo gáy sách ở giữa
-                        Canvas { ctx, size in
-                            var path = Path()
-                            path.move(to: CGPoint(x: size.width / 2.0, y: -12))
-                            path.addLine(to: CGPoint(x: size.width / 2.0, y: size.height + 12))
-                            ctx.stroke(
-                                path,
-                                with: .color(.white),
-                                style: StrokeStyle(lineWidth: 3.0, lineCap: .round, dash: [10, 8])
-                            )
-                        }
-
-                        // Chữ số 1 và 2 bán trong suốt ở giữa trang Trái & Phải
-                        HStack(spacing: 0) {
-                            Text(readingDirection == .leftToRight ? "1" : "2")
-                                .font(.system(size: 86, weight: .medium, design: .rounded))
-                                .foregroundStyle(Color.black.opacity(0.32))
-                                .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-                            Text(readingDirection == .leftToRight ? "2" : "1")
-                                .font(.system(size: 86, weight: .medium, design: .rounded))
-                                .foregroundStyle(Color.black.opacity(0.32))
-                                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        }
+                    // Viền khung: Xanh ngọc nét liền khi ĐÃ nhận diện được trang sách; Trắng mờ nét đứt khi CHƯA thấy sách
+                    if cameraController.isBookDetected {
+                        RoundedRectangle(cornerRadius: 4)
+                            .stroke(vFlatTeal, lineWidth: 3.4)
                     } else {
-                        Text("1")
-                            .font(.system(size: 86, weight: .medium, design: .rounded))
-                            .foregroundStyle(Color.black.opacity(0.32))
+                        RoundedRectangle(cornerRadius: 4)
+                            .stroke(
+                                Color.white.opacity(0.55),
+                                style: StrokeStyle(lineWidth: 2.2, dash: [8, 6])
+                            )
+                    }
+
+                    // Đường đứt nét trắng chạy DỌC theo gáy sách (chia đôi Trang Trái 1 và Trang Phải 2)
+                    Canvas { ctx, size in
+                        var path = Path()
+                        path.move(to: CGPoint(x: size.width / 2.0, y: -10))
+                        path.addLine(to: CGPoint(x: size.width / 2.0, y: size.height + 10))
+                        ctx.stroke(
+                            path,
+                            with: .color(cameraController.isBookDetected ? .white : .white.opacity(0.55)),
+                            style: StrokeStyle(lineWidth: 3.0, lineCap: .round, dash: [10, 8])
+                        )
+                    }
+
+                    // Số 1 (Trang Trái) và Số 2 (Trang Phải) đứng thẳng chuẩn chiều ngang của sách
+                    HStack(spacing: 0) {
+                        Text(readingDirection == .leftToRight ? "1" : "2")
+                            .font(.system(size: 84, weight: .medium, design: .rounded))
+                            .foregroundStyle(
+                                cameraController.isBookDetected
+                                    ? Color.black.opacity(0.35)
+                                    : Color.white.opacity(0.28)
+                            )
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                        Text(readingDirection == .leftToRight ? "2" : "1")
+                            .font(.system(size: 84, weight: .medium, design: .rounded))
+                            .foregroundStyle(
+                                cameraController.isBookDetected
+                                    ? Color.black.opacity(0.35)
+                                    : Color.white.opacity(0.28)
+                            )
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                 }
-                .frame(width: boxRect.width, height: boxRect.height)
-                .position(x: boxRect.midX, y: boxRect.midY)
+                .frame(width: boxWidth, height: boxHeight)
+                .position(x: boxCenterX, y: boxCenterY)
+                .animation(.easeOut(duration: 0.15), value: cameraController.isBookDetected)
 
-                // Nhãn hướng dẫn trạng thái Auto-Capture trên kính ngắm
+                // Thanh trạng thái nằm ngang ở mép trên của khung ngắm
                 VStack {
-                    HStack {
+                    HStack(spacing: 10) {
                         if rescanMode != .normalAppend {
                             Button {
                                 rescanMode = .normalAppend
@@ -1227,22 +1343,89 @@ struct VFlatMainContainerView: View {
                                 .foregroundStyle(.white)
                                 .padding(.horizontal, 12)
                                 .padding(.vertical, 6)
-                                .background(Color.orange.opacity(0.9))
+                                .background(Color.orange.opacity(0.92))
                                 .clipShape(Capsule())
                             }
                         } else {
                             statusBadgeOnViewfinder
                         }
+
                         Spacer()
+
+                        if let toast = statusToastText {
+                            Text(toast)
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .background(Color.black.opacity(0.78))
+                                .clipShape(Capsule())
+                        }
                     }
-                    .padding(16)
+                    .padding(.horizontal, 22)
+                    .padding(.top, 14)
+
                     Spacer()
                 }
+            }
+        }
+    }
 
-                // Hiệu ứng chớp màn trập khi chụp
-                if cameraController.shutterFlashTrigger {
-                    Color.white.opacity(0.65)
-                        .ignoresSafeArea()
+    private var singlePagePortraitViewfinderOverlay: some View {
+        GeometryReader { viewGeo in
+            let boxW = viewGeo.size.width * 0.82
+            let boxH = viewGeo.size.height * 0.76
+
+            ZStack {
+                ZStack {
+                    if cameraController.isBookDetected && cameraController.autoFillProgress > 0.01 {
+                        GeometryReader { boxGeo in
+                            let fillH = boxGeo.size.height * cameraController.autoFillProgress
+                            Rectangle()
+                                .fill(vFlatTeal.opacity(0.42))
+                                .frame(width: boxGeo.size.width, height: fillH)
+                                .position(
+                                    x: boxGeo.size.width / 2.0,
+                                    y: boxGeo.size.height - fillH / 2.0
+                                )
+                        }
+                    }
+
+                    if cameraController.isBookDetected {
+                        RoundedRectangle(cornerRadius: 4)
+                            .stroke(vFlatTeal, lineWidth: 3.4)
+                    } else {
+                        RoundedRectangle(cornerRadius: 4)
+                            .stroke(
+                                Color.white.opacity(0.55),
+                                style: StrokeStyle(lineWidth: 2.2, dash: [8, 6])
+                            )
+                    }
+
+                    Text("1")
+                        .font(.system(size: 84, weight: .medium, design: .rounded))
+                        .foregroundStyle(
+                            cameraController.isBookDetected
+                                ? Color.black.opacity(0.35)
+                                : Color.white.opacity(0.28)
+                        )
+                }
+                .frame(width: boxW, height: boxH)
+                .position(x: viewGeo.size.width / 2.0, y: viewGeo.size.height / 2.0)
+
+                VStack {
+                    statusBadgeOnViewfinder
+                        .padding(.top, 50)
+                    if let toast = statusToastText {
+                        Text(toast)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(Color.black.opacity(0.78))
+                            .clipShape(Capsule())
+                    }
+                    Spacer()
                 }
             }
         }
@@ -1254,183 +1437,198 @@ struct VFlatMainContainerView: View {
 
         switch cameraController.autoStatus {
         case .manualOnly:
-            labelText = "Chế độ chụp tay (Bấm nút tròn hoặc bật AUTO)"
-            badgeColor = .black.opacity(0.55)
-        case .searchingBook:
-            labelText = "AUTO: Giữ trang sách phẳng & đứng yên để tự chụp..."
-            badgeColor = .black.opacity(0.55)
+            labelText = cameraController.isBookDetected
+                ? "Đã nhận diện trang sách (Bấm nút tròn để chụp)"
+                : "Chế độ chụp tay (Đưa sách vào khung ngắm)"
+            badgeColor = .black.opacity(0.62)
+        case .noBookDetected:
+            labelText = "Đưa trang sách vào khung ngắm (Chỉ tự chụp khi nhận diện được sách)"
+            badgeColor = .black.opacity(0.68)
         case .stabilizing(let progress):
-            labelText = "Đang tự chụp... \(Int(progress * 100))%"
-            badgeColor = Color(red: 0.08, green: 0.62, blue: 0.52).opacity(0.88)
-        case .capturing:
-            labelText = "Đang tách 2 trang..."
-            badgeColor = .blue.opacity(0.85)
-        case .waitingForPageTurn:
-            labelText = "Đã lưu! Hãy lật sang trang tiếp theo (Không cần bấm nút)"
-            badgeColor = Color.green.opacity(0.82)
-        }
-
-        return Text(labelText)
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(.white)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(badgeColor)
-            .clipShape(Capsule())
-    }
-
-    /// Bảng điều khiển trắng của Camera giống hệt Ảnh 1 & Ảnh 2 của vFlat
-    private func vFlatCameraControlPanel(isLandscape: Bool) -> some View {
-        Group {
-            if isLandscape {
-                HStack(spacing: 8) {
-                    // Cột trái: 5 nút tính năng nhanh của vFlat (More, AUTO, Timer, Flash, [1|2])
-                    VStack(spacing: 0) {
-                        moreOptionsCameraMenu
-                        Spacer()
-                        autoCaptureToggleButton
-                        Spacer()
-                        timerSpeedButton
-                        Spacer()
-                        torchToggleButton
-                        Spacer()
-                        twoPageToggleButton
-                    }
-                    .padding(.vertical, 20)
-                    .frame(width: 46)
-
-                    // Cột giữa & phải: Nút Library ở trên, Nút chụp tròn lớn ở giữa, Thumbnail + Tên thư mục ở dưới
-                    VStack(spacing: 14) {
-                        Button {
-                            withAnimation(.easeInOut(duration: 0.2)) {
-                                isShowingLibrary = true
-                            }
-                        } label: {
-                            VStack(spacing: 4) {
-                                Image(systemName: "folder")
-                                    .font(.system(size: 22, weight: .medium))
-                                Text("Library")
-                                    .font(.caption.weight(.medium))
-                            }
-                            .foregroundStyle(Color.black.opacity(0.75))
-                        }
-                        .padding(.top, 18)
-
-                        Spacer()
-
-                        // Nút chụp tròn lớn chuẩn vFlat
-                        Button {
-                            cameraController.triggerManualCapture()
-                        } label: {
-                            ZStack {
-                                Circle()
-                                    .stroke(Color.gray.opacity(0.38), lineWidth: 5)
-                                    .frame(width: 72, height: 72)
-                                Circle()
-                                    .fill(Color.white)
-                                    .frame(width: 60, height: 60)
-                                if isProcessingShot {
-                                    ProgressView()
-                                        .tint(vFlatTeal)
-                                }
-                            }
-                        }
-
-                        Spacer()
-
-                        // Thumbnail trang vừa quét & thanh tên thư mục
-                        HStack(spacing: 10) {
-                            latestThumbnailButton
-                            folderPillButton
-                        }
-                        .padding(.bottom, 18)
-                    }
-                    .frame(maxWidth: .infinity)
-                }
-                .padding(.horizontal, 8)
+            if progress > 0.04 {
+                labelText = "Đã nhận diện trang sách — Đang tự chụp... \(Int(progress * 100))%"
+                badgeColor = Color(red: 0.08, green: 0.62, blue: 0.52).opacity(0.90)
             } else {
-                // Bố cục khi cầm dọc điện thoại
-                VStack(spacing: 12) {
-                    // Hàng trên: 5 nút tính năng nhanh (More, AUTO, Timer, Flash, [1|2])
-                    HStack {
-                        moreOptionsCameraMenu
-                        Spacer()
-                        autoCaptureToggleButton
-                        Spacer()
-                        timerSpeedButton
-                        Spacer()
-                        torchToggleButton
-                        Spacer()
-                        twoPageToggleButton
-                    }
-                    .padding(.horizontal, 24)
-                    .padding(.top, 12)
-
-                    Spacer()
-
-                    // Hàng dưới: Library — Nút chụp tròn — Thumbnail
-                    HStack {
-                        Button {
-                            withAnimation(.easeInOut(duration: 0.2)) {
-                                isShowingLibrary = true
-                            }
-                        } label: {
-                            VStack(spacing: 4) {
-                                Image(systemName: "folder")
-                                    .font(.system(size: 22, weight: .medium))
-                                Text("Library (\(pages.count))")
-                                    .font(.caption.weight(.medium))
-                            }
-                            .foregroundStyle(Color.black.opacity(0.75))
-                        }
-                        .frame(width: 90)
-
-                        Spacer()
-
-                        Button {
-                            cameraController.triggerManualCapture()
-                        } label: {
-                            ZStack {
-                                Circle()
-                                    .stroke(Color.gray.opacity(0.38), lineWidth: 5)
-                                    .frame(width: 72, height: 72)
-                                Circle()
-                                    .fill(Color.white)
-                                    .frame(width: 60, height: 60)
-                                if isProcessingShot {
-                                    ProgressView()
-                                        .tint(vFlatTeal)
-                                }
-                            }
-                        }
-
-                        Spacer()
-
-                        latestThumbnailButton
-                            .frame(width: 90)
-                    }
-                    .padding(.horizontal, 20)
-                    .padding(.bottom, 16)
-                }
+                labelText = "Đã nhận diện trang sách — Giữ phẳng để tự chụp..."
+                badgeColor = Color(red: 0.08, green: 0.62, blue: 0.52).opacity(0.85)
             }
+        case .capturing:
+            labelText = "Đang chụp & tách 2 trang..."
+            badgeColor = .blue.opacity(0.88)
+        case .waitingForPageTurn:
+            labelText = "Đã lưu! Hãy lật sang trang tiếp theo để tự chụp tiếp"
+            badgeColor = Color.green.opacity(0.85)
+        }
+
+        return HStack(spacing: 6) {
+            Circle()
+                .fill(cameraController.isBookDetected ? vFlatTeal : Color.gray)
+                .frame(width: 8, height: 8)
+            Text(labelText)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(badgeColor)
+        .clipShape(Capsule())
+    }
+
+    /// Bảng điều khiển trắng bên phải màn hình ngang (Giống hệt Ảnh 1 & Ảnh 2 của vFlat)
+    private var vFlatLandscapeRightControlPanel: some View {
+        HStack(spacing: 6) {
+            // Cột trái: 5 nút tính năng nhanh của vFlat (More, AUTO, Timer, Flash, [1|2])
+            VStack(spacing: 0) {
+                moreOptionsCameraMenu
+                Spacer()
+                autoCaptureToggleButton
+                Spacer()
+                timerSpeedButton
+                Spacer()
+                torchToggleButton
+                Spacer()
+                twoPageToggleButton
+            }
+            .padding(.vertical, 18)
+            .frame(width: 44)
+
+            // Cột phải: Library ở trên, Nút chụp tròn ở giữa, Thumbnail + Tên thư mục ở dưới
+            VStack(spacing: 10) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isShowingLibrary = true
+                    }
+                } label: {
+                    VStack(spacing: 3) {
+                        Image(systemName: "folder")
+                            .font(.system(size: 22, weight: .medium))
+                        Text("Library (\(pages.count))")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .foregroundStyle(Color.black.opacity(0.78))
+                }
+                .padding(.top, 16)
+
+                Spacer()
+
+                Button {
+                    cameraController.triggerManualCapture()
+                } label: {
+                    ZStack {
+                        Circle()
+                            .stroke(
+                                cameraController.isBookDetected ? vFlatTeal : Color.gray.opacity(0.38),
+                                lineWidth: 5
+                            )
+                            .frame(width: 72, height: 72)
+                        Circle()
+                            .fill(Color.white)
+                            .frame(width: 60, height: 60)
+                        if isProcessingShot {
+                            ProgressView()
+                                .tint(vFlatTeal)
+                        }
+                    }
+                }
+
+                Spacer()
+
+                VStack(spacing: 8) {
+                    latestThumbnailButton
+                    folderPillButton
+                }
+                .padding(.bottom, 14)
+            }
+            .frame(maxWidth: .infinity)
+        }
+        .padding(.horizontal, 8)
+    }
+
+    private var vFlatPortraitBottomControlPanel: some View {
+        VStack(spacing: 12) {
+            HStack {
+                moreOptionsCameraMenu
+                Spacer()
+                autoCaptureToggleButton
+                Spacer()
+                timerSpeedButton
+                Spacer()
+                torchToggleButton
+                Spacer()
+                twoPageToggleButton
+            }
+            .padding(.horizontal, 24)
+            .padding(.top, 12)
+
+            Spacer()
+
+            HStack {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isShowingLibrary = true
+                    }
+                } label: {
+                    VStack(spacing: 4) {
+                        Image(systemName: "folder")
+                            .font(.system(size: 22, weight: .medium))
+                        Text("Library (\(pages.count))")
+                            .font(.caption.weight(.medium))
+                    }
+                    .foregroundStyle(Color.black.opacity(0.75))
+                }
+                .frame(width: 90)
+
+                Spacer()
+
+                Button {
+                    cameraController.triggerManualCapture()
+                } label: {
+                    ZStack {
+                        Circle()
+                            .stroke(
+                                cameraController.isBookDetected ? vFlatTeal : Color.gray.opacity(0.38),
+                                lineWidth: 5
+                            )
+                            .frame(width: 72, height: 72)
+                        Circle()
+                            .fill(Color.white)
+                            .frame(width: 60, height: 60)
+                        if isProcessingShot {
+                            ProgressView()
+                                .tint(vFlatTeal)
+                        }
+                    }
+                }
+
+                Spacer()
+
+                latestThumbnailButton
+                    .frame(width: 90)
+            }
+            .padding(.horizontal, 20)
+            .padding(.bottom, 16)
         }
     }
 
-    // Các nút điều khiển nhỏ trên bảng Camera vFlat
     private var moreOptionsCameraMenu: some View {
         Menu {
             Section("Phiên bản: \(AppVersionHelper.displayString)") {
                 Picker("Thứ tự trang đôi", selection: $readingDirection) {
-                ForEach(ReadingDirection.allCases) { dir in
-                    Text(dir.rawValue).tag(dir)
+                    ForEach(ReadingDirection.allCases) { dir in
+                        Text(dir.rawValue).tag(dir)
+                    }
                 }
-            }
-            Picker("Chế độ làm sạch AI", selection: $enhancementFilter) {
-                ForEach(EnhancementFilter.allCases) { f in
-                    Text(f.rawValue).tag(f)
+                Picker("Chế độ làm sạch AI", selection: $enhancementFilter) {
+                    ForEach(EnhancementFilter.allCases) { f in
+                        Text(f.rawValue).tag(f)
+                    }
                 }
-            }
                 Toggle("Tự xóa ngón tay ở mép sách", isOn: $removeFingersAtEdges)
+                Button {
+                    landscapeFlipped180.toggle()
+                } label: {
+                    Label("Đảo chiều màn hình ngang 180°", systemImage: "rectangle.landscape.rotate")
+                }
             }
         } label: {
             Image(systemName: "ellipsis.circle")
@@ -1455,15 +1653,15 @@ struct VFlatMainContainerView: View {
 
     private var timerSpeedButton: some View {
         Button {
-            if cameraController.holdDurationSeconds < 1.2 {
+            if cameraController.holdDurationSeconds < 1.3 {
                 cameraController.holdDurationSeconds = 1.8
-                showToast("Tốc độ tự chụp: 1.8 giây")
+                showToast("Tốc độ giữ tự chụp: 1.8 giây")
             } else if cameraController.holdDurationSeconds < 2.0 {
                 cameraController.holdDurationSeconds = 2.5
-                showToast("Tốc độ tự chụp: 2.5 giây")
+                showToast("Tốc độ giữ tự chụp: 2.5 giây")
             } else {
-                cameraController.holdDurationSeconds = 1.0
-                showToast("Tốc độ tự chụp nhanh: 1.0 giây")
+                cameraController.holdDurationSeconds = 1.2
+                showToast("Tốc độ giữ tự chụp: 1.2 giây")
             }
         } label: {
             VStack(spacing: 1) {
@@ -1488,8 +1686,10 @@ struct VFlatMainContainerView: View {
 
     private var twoPageToggleButton: some View {
         Button {
-            twoPageMode.toggle()
-            showToast(twoPageMode ? "Chế độ: Quét & Tách 2 Trang [1|2]" : "Chế độ: Quét 1 Trang Đơn")
+            withAnimation(.easeInOut(duration: 0.22)) {
+                twoPageMode.toggle()
+            }
+            showToast(twoPageMode ? "Chế độ 2 Trang: Đã khóa màn hình ngang [1|2]" : "Chế độ 1 Trang đơn")
         } label: {
             HStack(spacing: 1) {
                 Text("1")
@@ -1523,7 +1723,7 @@ struct VFlatMainContainerView: View {
                     Image(uiImage: lastPage.processedImage)
                         .resizable()
                         .scaledToFill()
-                        .frame(width: 48, height: 62)
+                        .frame(width: 46, height: 58)
                         .clipShape(RoundedRectangle(cornerRadius: 5))
                         .overlay(
                             RoundedRectangle(cornerRadius: 5)
@@ -1532,7 +1732,7 @@ struct VFlatMainContainerView: View {
                 } else {
                     RoundedRectangle(cornerRadius: 5)
                         .fill(Color.gray.opacity(0.12))
-                        .frame(width: 48, height: 62)
+                        .frame(width: 46, height: 58)
                         .overlay(
                             Image(systemName: "doc.text")
                                 .font(.caption)
@@ -1569,18 +1769,19 @@ struct VFlatMainContainerView: View {
             }
             .foregroundStyle(Color.black.opacity(0.65))
             .padding(.horizontal, 8)
-            .padding(.vertical, 6)
+            .padding(.vertical, 5)
             .background(Color.gray.opacity(0.12))
             .clipShape(Capsule())
         }
     }
 
-    // MARK: - Xử lý ảnh vừa chụp (Tự động tách 2 trang ngầm không làm gián đoạn việc lật sách)
+    // MARK: - Xử lý ảnh vừa chụp
 
     private func handleCapturedPhoto(_ rawImage: UIImage) {
         isProcessingShot = true
         let currentMode = rescanMode
         let isTwoPage = twoPageMode
+        let isFlipped180 = landscapeFlipped180
         let currentDir = readingDirection
         let currentFilter = enhancementFilter
         let currentTrim = CGFloat(gutterTrimPercent / 100.0)
@@ -1595,7 +1796,8 @@ struct VFlatMainContainerView: View {
                     readingDirection: currentDir,
                     enhancement: currentFilter,
                     gutterTrimRatio: currentTrim,
-                    removeFingers: currentRemoveFingers
+                    removeFingers: currentRemoveFingers,
+                    landscapeFlipped180: isFlipped180
                 )
                 await MainActor.run {
                     self.pages.append(contentsOf: newSplitPages)
@@ -1604,7 +1806,12 @@ struct VFlatMainContainerView: View {
                 }
 
             case .replaceSinglePage(let targetID):
-                let flattened = BookSpineProcessor.shared.autoCropAndFlattenBook(rawImage)
+                let oriented = BookSpineProcessor.shared.ensureLandscapeSpread(
+                    rawImage,
+                    isTwoPageMode: isTwoPage,
+                    landscapeFlipped180: isFlipped180
+                )
+                let flattened = BookSpineProcessor.shared.autoCropAndFlattenBook(oriented)
                 let enhanced = BookSpineProcessor.shared.applyEnhancement(
                     flattened,
                     filter: currentFilter,
@@ -1633,7 +1840,8 @@ struct VFlatMainContainerView: View {
                     readingDirection: currentDir,
                     enhancement: currentFilter,
                     gutterTrimRatio: currentTrim,
-                    removeFingers: currentRemoveFingers
+                    removeFingers: currentRemoveFingers,
+                    landscapeFlipped180: isFlipped180
                 )
                 await MainActor.run {
                     if let idx = self.pages.firstIndex(where: { $0.id == targetID }) {
@@ -1777,7 +1985,6 @@ struct VFlatLibraryGridView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Thanh tiêu đề trên cùng giống Ảnh 4 (Mũi tên quay lại, Tên thư mục, Tìm kiếm & Menu)
             HStack(spacing: 14) {
                 Button {
                     onOpenCamera(.normalAppend)
@@ -1843,7 +2050,6 @@ struct VFlatLibraryGridView: View {
             .padding(.vertical, 14)
             .background(Color.white)
 
-            // Lưới hiển thị các trang sách + Nút tròn xanh lá mở Camera ở góc dưới phải (Giống Ảnh 4)
             ZStack(alignment: .bottomTrailing) {
                 Color(white: 0.965).ignoresSafeArea()
 
@@ -1875,7 +2081,6 @@ struct VFlatLibraryGridView: View {
                     }
                 }
 
-                // Nút tròn xanh ngọc mở Camera quét tiếp (Giống hệt Ảnh 4)
                 Button {
                     onOpenCamera(.normalAppend)
                 } label: {
@@ -1894,7 +2099,6 @@ struct VFlatLibraryGridView: View {
                 .padding(.bottom, 20)
             }
 
-            // Thanh 5 công cụ dưới đáy chuẩn vFlat (Create PDF | AI Cleanup | Delete | Import | More)
             HStack(spacing: 0) {
                 bottomBarItem(icon: "doc.richtext", title: "Create PDF", tint: .black) {
                     onExportPDF()
@@ -2013,7 +2217,6 @@ struct VFlatLibraryGridView: View {
                 }
             }
 
-            // Số thứ tự trang rõ ràng bên dưới giống hệt Ảnh 4 (10, 11, 12, 13...)
             Text("\(index + 1)")
                 .font(.system(size: 15, weight: .semibold))
                 .foregroundStyle(.black.opacity(0.85))
@@ -2052,7 +2255,6 @@ struct VFlatPagePagerView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Thanh tiêu đề trên cùng giống Ảnh 3: Mũi tên quay lại + Tên thư mục & "16 / 16"
             HStack(spacing: 14) {
                 Button {
                     dismiss()
@@ -2088,7 +2290,6 @@ struct VFlatPagePagerView: View {
             .padding(.vertical, 10)
             .background(Color.white)
 
-            // Vùng vuốt xem từng trang + Nút nổi "[T] Run Text Recognition" giống hệt Ảnh 3
             ZStack(alignment: .bottom) {
                 Color(white: 0.96).ignoresSafeArea()
 
@@ -2106,7 +2307,6 @@ struct VFlatPagePagerView: View {
                     .tabViewStyle(.page(indexDisplayMode: .never))
                 }
 
-                // Nút nổi "[T] Run Text Recognition" ngay phía trên thanh công cụ dưới (Giống Ảnh 3)
                 HStack(spacing: 12) {
                     Button {
                         runOCROnCurrentPage()
@@ -2133,7 +2333,6 @@ struct VFlatPagePagerView: View {
                 .padding(.bottom, 16)
             }
 
-            // Thanh 5 nút dưới đáy giống hệt Ảnh 3: Rescan | AI Cleanup | Create PDF | Crop | More
             HStack(spacing: 0) {
                 pagerBottomButton(icon: "arrow.triangle.2.circlepath.camera", title: "Rescan") {
                     isShowingRescanDialog = true
@@ -2312,7 +2511,7 @@ struct VFlatPagePagerView: View {
     }
 }
 
-// MARK: - 4. Bảng Chỉnh Vạch Cắt Gáy Sách & Crop (Khi bấm nút Crop ở Ảnh 3)
+// MARK: - 4. Bảng Chỉnh Vạch Cắt Gáy Sách & Crop
 
 struct SpineAndCropAdjustSheet: View {
     @Environment(\.dismiss) private var dismiss
@@ -2448,7 +2647,7 @@ struct SpineAndCropAdjustSheet: View {
     }
 }
 
-// MARK: - 5. Bảng Kết Quả Nhận Diện Văn Bản OCR (Run Text Recognition)
+// MARK: - 5. Bảng Kết Quả Nhận Diện Văn Bản OCR
 
 struct OCRTextResultSheet: View {
     @Environment(\.dismiss) private var dismiss

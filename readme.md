@@ -1,25 +1,17 @@
-# Hướng Dẫn Tạo File `.ipa` Có Đánh Số Phiên Bản Tự Động (Chuẩn Giao Diện vFlat)
+# Hướng Dẫn Tạo File `.ipa` Phiên Bản `v2.1.0` (Khóa Ngang Chế Độ 2 Trang & Nhận Diện Sách Chính Xác)
 
-Bộ mã nguồn này biên dịch ứng dụng iOS gốc **BookSplitScanner** (phiên bản **`v2.0.0`** — thiết kế theo đúng giao diện và cơ chế **Quét 2 trang tự động không cần chạm** của [vFlat Scan](https://vflat.com/en)) thành file **`.ipa` có gắn sẵn số phiên bản và số thứ tự bản dựng (Build Number)** trực tiếp trên **GitHub Actions**.
+Bộ mã nguồn này biên dịch ứng dụng iOS gốc **BookSplitScanner (`v2.1.0`)** thành file **`BookSplitScanner-v2.1.0-bX.ipa`** trực tiếp trên **GitHub Actions**.
 
-## 1. Quy tắc đánh số phiên bản tự động trên tên file `.ipa`
+## 1. Lịch sử cập nhật phiên bản (`Changelog`)
 
-Mỗi khi có thay đổi mã nguồn hoặc mỗi lần GitHub Actions chạy, hệ thống sẽ tự động đọc hằng số `let APP_VERSION = "2.0.0"` ở đầu file `BookSplitScannerApp.swift` kết hợp với số thứ tự lần chạy (`run_number`) của GitHub để đặt tên file:
+| Phiên bản (`APP_VERSION`) | Tên file `.ipa` xuất ra | Nội dung sửa lỗi & nâng cấp chính |
+| :--- | :--- | :--- |
+| **`v2.1.0` (Mới nhất)** | **`BookSplitScanner-v2.1.0-bX.ipa`** | **1. Khóa cố định màn hình ngang khi ở chế độ 2 trang (`[1\|2]`):** Không bị ảnh hưởng bởi chế độ Tự xoay / Khóa xoay của iPhone; vạch đứt nét cắt dọc đúng gáy sách, số `1 \| 2` và các nút điều khiển đứng thẳng đúng chiều cầm ngang.<br>**2. Chỉ tự chụp khi thực sự nhận diện được trang sách:** Kết hợp `VNDetectRectanglesRequest` + kiểm tra độ sáng nền giấy & mật độ dòng chữ in (khắc phục triệt để lỗi tự chụp khi chỉa camera ra bàn/sàn nhà). |
+| `v2.0.0` | `BookSplitScanner-v2.0.0-bX.ipa` | Làm lại giao diện Camera & Library 2 cột theo chuẩn [vFlat Scan](https://vflat.com/en), tích hợp AI Cleanup và OCR tiếng Việt |
+| `v1.1.0` | `BookSplitScanner.ipa` | Bổ sung tính năng chụp lại (`Rescan`) thay thế đúng vị trí trang lỗi |
 
-* **Tên gói tải về tại mục Artifacts**: `BookSplitScanner-v2.0.0-b3` (trong đó `v2.0.0` là phiên bản tính năng, `b3` là bản build lần thứ 3).
-* **Tên file `.ipa` bên trong sau khi giải nén**: `BookSplitScanner-v2.0.0-b3.ipa`.
-* **Hiển thị trực tiếp trong ứng dụng trên iPhone**: Khi bấm vào nút `...` trên màn hình Camera hoặc trong mục `Library`, bạn sẽ thấy dòng chữ `Phiên bản: v2.0.0 (Build 3)` để biết chắc chắn mình đã cài đúng bản mới nhất.
+## 2. Cách cập nhật lên `v2.1.0` trên GitHub
 
-| Lần cập nhật     | Số phiên bản (`APP_VERSION`) | Tên file `.ipa` xuất ra (Ví dụ)      | Nội dung thay đổi chính                                      |
-| :--------------- | :--------------------------- | :----------------------------------- | :----------------------------------------------------------- |
-| Bản đầu tiên     | `v1.0.0`                     | `BookSplitScanner.ipa`               | Bản cơ bản dùng trình quét mặc định của iOS (`VNDocumentCameraViewController`) |
-| Bản nâng cấp 1   | `v1.1.0`                     | `BookSplitScanner.ipa`               | Bổ sung tính năng chụp lại (`Rescan`) thay thế đúng vị trí trang lỗi |
-| **Bản hiện tại** | **`v2.0.0`**                 | **`BookSplitScanner-v2.0.0-b3.ipa`** | **Làm lại toàn bộ giao diện & luồng quét giống hệt vFlat: Mở thẳng Camera `[1 \| 2]`, thanh xanh ngọc tự dâng và tự chụp khi ngừng lật trang (No-Tapping Auto-Capture), AI Cleanup khử bóng/ngón tay, OCR tiếng Việt và màn hình Library 2 cột** |
-
-## 2. Cách cập nhật lên phiên bản `v2.0.0` trên GitHub của bạn
-
-Để kích hoạt cơ chế tự động gắn số phiên bản vào tên file `.ipa`, bạn cập nhật 2 file trên [GitHub](https://github.com) của mình:
-
-1. **Cập nhật `BookSplitScannerApp.swift`**: Mở file `BookSplitScannerApp.swift` trên GitHub → bấm biểu tượng **Cây bút (Edit)** → dán toàn bộ nội dung mới từ khung Canvas vào → bấm **Commit changes**.
-2. **Cập nhật `.github/workflows/build-ipa.yml`**: Mở file `.github/workflows/build-ipa.yml` trên GitHub → bấm biểu tượng **Cây bút (Edit)** → dán toàn bộ nội dung của file **`build-ipa.yml`** mới vào → bấm **Commit changes**.
-3. **Tải file `.ipa` có gắn số phiên bản**: Vào tab **Actions**, đợi khoảng 1–2 phút cho tiến trình **Build Versioned iOS IPA** hoàn tất, kéo xuống mục **Artifacts** để tải về file **`BookSplitScanner-v2.0.0-bX.ipa`**.
+1. Mở file **`BookSplitScannerApp.swift`** trên [GitHub](https://github.com) của bạn → bấm biểu tượng **Cây bút (Edit)** → dán toàn bộ nội dung mới từ khung Canvas (`let APP_VERSION = "2.1.0"`) vào → bấm **Commit changes**.
+2. *(Tùy chọn)* Nếu muốn khóa cứng hướng xoay hệ thống trong `Info.plist`, bạn cũng có thể cập nhật thêm file `.github/workflows/build-ipa.yml` và `project.yml` bên dưới.
+3. Vào tab **Actions**, đợi 1–2 phút và tải gói **`BookSplitScanner-v2.1.0-bX`** tại mục **Artifacts**.

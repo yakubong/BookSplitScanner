@@ -23,7 +23,7 @@ jobs:
           set -e
           VER=$(grep -Eo 'let APP_VERSION = "[0-9]+\.[0-9]+\.[0-9]+"' BookSplitScannerApp.swift | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)
           if [ -z "$VER" ]; then
-            VER="2.0.0"
+            VER="2.1.0"
           fi
           BUILD_NUM="${{ github.run_number }}"
           IPA_NAME="BookSplitScanner-v${VER}-b${BUILD_NUM}.ipa"
@@ -34,7 +34,7 @@ jobs:
           echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> $GITHUB_ENV
           echo "Đang chuẩn bị tạo phiên bản: v${VER} (Build ${BUILD_NUM}) -> ${IPA_NAME}"
 
-      - name: 3. Tạo cấu hình XcodeGen (project.yml) với số phiên bản tự động
+      - name: 3. Tạo cấu hình XcodeGen (project.yml) khóa hướng xoay hệ thống và gắn số phiên bản
         shell: bash
         run: |
           set -e
@@ -84,13 +84,8 @@ jobs:
                   NSPhotoLibraryAddUsageDescription: "Ứng dụng cần quyền lưu ảnh trang sách đã tách vào Thư viện ảnh."
                   UISupportedInterfaceOrientations:
                     - UIInterfaceOrientationPortrait
-                    - UIInterfaceOrientationLandscapeLeft
-                    - UIInterfaceOrientationLandscapeRight
                   UISupportedInterfaceOrientations~ipad:
                     - UIInterfaceOrientationPortrait
-                    - UIInterfaceOrientationPortraitUpsideDown
-                    - UIInterfaceOrientationLandscapeLeft
-                    - UIInterfaceOrientationLandscapeRight
           EOF
 
       - name: 4. Cài đặt XcodeGen và khởi tạo dự án Xcode (.xcodeproj)
