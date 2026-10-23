@@ -984,18 +984,23 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
         let region = quad?.rect ?? centerRegion
         let metrics = evaluatePageContent(pixelBuffer: pixelBuffer, region: region)
 
-        let hasPaper = metrics.paperLevel >= 80 && metrics.paperRatio >= 0.40
         let rawBookDetected: Bool
         let candidateRect: NormalizedBookRect
         if let quad {
+            let adaptive = adaptiveCaptureThresholds(for: metrics, holdDuration: holdDurationSeconds)
+            let hasPaper = metrics.paperLevel >= adaptive.minPaperLevel && metrics.paperRatio >= adaptive.minPaperRatioWithQuad
             let trustedDocument = quad.isDocument && quad.confidence >= 0.8
-            rawBookDetected = hasPaper && (metrics.textTransitions >= 16 || trustedDocument)
+            rawBookDetected = hasPaper && (metrics.textTransitions >= adaptive.minTextTransitionsWithQuad || trustedDocument)
             candidateRect = NormalizedBookRect(
                 x: quad.rect.minX, y: quad.rect.minY, width: quad.rect.width, height: quad.rect.height
             )
         } else {
+            let adaptive = adaptiveCaptureThresholds(for: metrics, holdDuration: holdDurationSeconds)
+            let hasPaper = metrics.paperLevel >= adaptive.minPaperLevel && metrics.paperRatio >= adaptive.minPaperRatioWithQuad
             // Không thấy mép sách: chỉ chấp nhận khi nền giấy sáng và mật độ chữ rất rõ ràng
-            rawBookDetected = hasPaper && metrics.paperRatio >= 0.55 && metrics.textTransitions >= 30
+            rawBookDetected = hasPaper &&
+            metrics.paperRatio >= adaptive.minPaperRatioNoQuad &&
+            metrics.textTransitions >= adaptive.minTextTransitionsNoQuad
             candidateRect = NormalizedBookRect(x: 0.04, y: 0.04, width: 0.92, height: 0.92)
         }
 
@@ -1029,6 +1034,7 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
             self.isBookDetected = confirmedBookPresent
 
             guard self.autoCaptureEnabled, !self.isCapturingPhoto else { return }
+            let adaptive = self.adaptiveCaptureThresholds(for: metrics, holdDuration: self.holdDurationSeconds)
 
             // QUAN TRỌNG: Nếu KHÔNG nhận diện được trang sách -> Tuyệt đối không tự chụp, đưa thanh đếm về 0% ngay lập tức!
             if !confirmedBookPresent {
@@ -1036,7 +1042,7 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
                 self.autoFillProgress = 0.0
                 if self.autoStatus != .waitingForPageTurn {
                     self.autoStatus = .noBookDetected
-                } else if motionScore > 0.038 {
+                } else if motionScore > adaptive.noBookMotionThreshold {
                     self.pageTurnMotionFrames += 1
                 }
                 return
@@ -1045,10 +1051,12 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
             // Nếu vừa chụp xong 1 trang đôi, bắt buộc chờ người dùng lật sang trang mới
             // (phải có chuyển động lật trang VÀ nội dung trang mới khác trang vừa chụp)
             if self.autoStatus == .waitingForPageTurn {
-                if motionScore > 0.034 {
+                if motionScore > adaptive.pageTurnMotionThreshold {
                     self.pageTurnMotionFrames += 1
                 }
-                if self.pageTurnMotionFrames >= 2 && diffFromLastCapture > 0.025 && motionScore < 0.03 {
+                if self.pageTurnMotionFrames >= 2 &&
+                    diffFromLastCapture > adaptive.pageTurnDiffThreshold &&
+                    motionScore < adaptive.pageTurnStillThreshold {
                     self.stableElapsedSeconds = 0
                     self.autoFillProgress = 0
                     self.autoStatus = .stabilizing(progress: 0)
@@ -1058,7 +1066,8 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
 
             // Chụp kiểu vFlat: chỉ cần thấy trang sách và cầm máy TƯƠNG ĐỐI yên (cho phép rung tay nhẹ),
             // ảnh sẽ được chụp rộng kèm phần rìa rồi cắt & nắn phẳng ở bước xử lý sau.
-            let isRoughlyStill = motionScore < 0.03 && quadShift < 0.035
+            let isRoughlyStill = motionScore < adaptive.stillMotionThreshold &&
+            quadShift < adaptive.stillQuadShiftThreshold
             if isRoughlyStill {
                 self.stableElapsedSeconds += dt
                 let progress = min(1.0, max(0.0, CGFloat(self.stableElapsedSeconds / self.holdDurationSeconds)))
@@ -1070,7 +1079,7 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
                     self.pageTurnMotionFrames = 0
                     self.triggerManualCapture()
                 }
-            } else if motionScore > 0.08 {
+            } else if motionScore > adaptive.hardResetMotionThreshold {
                 // Di chuyển mạnh / đang lật trang -> đếm lại từ đầu
                 self.stableElapsedSeconds = 0
                 self.autoFillProgress = 0
@@ -1098,6 +1107,55 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
         let paperLevel: Double      // Độ sáng nền giấy (bách phân vị 70%)
         let paperRatio: Double      // Tỷ lệ điểm ảnh thuộc nền giấy
         let textTransitions: Int    // Số lần chuyển từ nền giấy sang nét chữ tối dọc các đường quét
+    }
+
+    /// Bộ ngưỡng tự chụp được tinh chỉnh theo điều kiện ánh sáng và tốc độ giữ (0.6 / 1.0 / 1.5s)
+    private struct AdaptiveCaptureThresholds {
+        let minPaperLevel: Double
+        let minPaperRatioWithQuad: Double
+        let minPaperRatioNoQuad: Double
+        let minTextTransitionsWithQuad: Int
+        let minTextTransitionsNoQuad: Int
+        let noBookMotionThreshold: Double
+        let pageTurnMotionThreshold: Double
+        let pageTurnDiffThreshold: Double
+        let pageTurnStillThreshold: Double
+        let stillMotionThreshold: Double
+        let stillQuadShiftThreshold: CGFloat
+        let hardResetMotionThreshold: Double
+    }
+
+    private func adaptiveCaptureThresholds(
+        for metrics: PageContentMetrics,
+        holdDuration: Double
+    ) -> AdaptiveCaptureThresholds {
+        let lowLight = metrics.paperLevel < 92
+        let slowHoldMode = holdDuration >= 1.2
+
+        var stillMotion = lowLight ? 0.036 : 0.03
+        var stillQuadShift: CGFloat = lowLight ? 0.040 : 0.035
+        var hardResetMotion = lowLight ? 0.10 : 0.08
+
+        if slowHoldMode {
+            stillMotion += 0.003
+            stillQuadShift += 0.004
+            hardResetMotion += 0.01
+        }
+
+        return AdaptiveCaptureThresholds(
+            minPaperLevel: lowLight ? 72 : 80,
+            minPaperRatioWithQuad: lowLight ? 0.34 : 0.40,
+            minPaperRatioNoQuad: lowLight ? 0.48 : 0.55,
+            minTextTransitionsWithQuad: lowLight ? 12 : 16,
+            minTextTransitionsNoQuad: lowLight ? 24 : 30,
+            noBookMotionThreshold: lowLight ? 0.042 : 0.038,
+            pageTurnMotionThreshold: lowLight ? 0.038 : 0.034,
+            pageTurnDiffThreshold: lowLight ? 0.020 : 0.025,
+            pageTurnStillThreshold: lowLight ? 0.035 : 0.03,
+            stillMotionThreshold: stillMotion,
+            stillQuadShiftThreshold: stillQuadShift,
+            hardResetMotionThreshold: hardResetMotion
+        )
     }
 
     /// Chọn khung trang sách tốt nhất: ưu tiên kết quả AI nhận diện tài liệu, sau đó đến hình chữ nhật lớn nhất
