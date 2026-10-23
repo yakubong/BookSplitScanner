@@ -8,7 +8,7 @@ import PhotosUI
 import UIKit
 
 // MARK: - App Version Constant (Tự động đọc bởi GitHub Actions để đặt tên file .ipa)
-let APP_VERSION = "2.2.0"
+let APP_VERSION = "2.3.0"
 
 enum AppVersionHelper {
     static var displayString: String {
@@ -143,6 +143,58 @@ struct NormalizedBookRect: Equatable {
     }
 }
 
+/// 4 góc trang sách theo tọa độ Vision (chuẩn hóa 0...1, gốc dưới-trái) trên khung hình camera dọc.
+/// Được ghi lại từ Preview ngay lúc chụp để làm "gợi ý" cắt & nắn phẳng khi ảnh chụp không tự dò được mép sách.
+struct PageQuad: Equatable {
+    var topLeft: CGPoint
+    var topRight: CGPoint
+    var bottomLeft: CGPoint
+    var bottomRight: CGPoint
+    /// Tỷ lệ rộng/cao của khung hình nơi tìm được 4 góc (để chỉ dùng gợi ý khi ảnh chụp cùng khung nhìn)
+    var sourceAspect: CGFloat
+
+    init(_ obs: VNRectangleObservation, sourceAspect: CGFloat) {
+        topLeft = obs.topLeft
+        topRight = obs.topRight
+        bottomLeft = obs.bottomLeft
+        bottomRight = obs.bottomRight
+        self.sourceAspect = sourceAspect
+    }
+
+    var center: CGPoint {
+        CGPoint(
+            x: (topLeft.x + topRight.x + bottomLeft.x + bottomRight.x) / 4.0,
+            y: (topLeft.y + topRight.y + bottomLeft.y + bottomRight.y) / 4.0
+        )
+    }
+
+    /// Độ dịch chuyển lớn nhất của 1 góc so với khung khác (để đo độ ổn định khi cầm tay)
+    func maxCornerDistance(to other: PageQuad) -> CGFloat {
+        func dist(_ a: CGPoint, _ b: CGPoint) -> CGFloat { hypot(a.x - b.x, a.y - b.y) }
+        return max(
+            dist(topLeft, other.topLeft), dist(topRight, other.topRight),
+            dist(bottomLeft, other.bottomLeft), dist(bottomRight, other.bottomRight)
+        )
+    }
+
+    /// Nới rộng khung ra ngoài một chút để không cắt mất chữ sát mép (giữ lại phần rìa trang)
+    func expanded(by ratio: CGFloat) -> PageQuad {
+        let c = center
+        func push(_ p: CGPoint) -> CGPoint {
+            CGPoint(
+                x: min(1.0, max(0.0, c.x + (p.x - c.x) * (1.0 + ratio))),
+                y: min(1.0, max(0.0, c.y + (p.y - c.y) * (1.0 + ratio)))
+            )
+        }
+        var q = self
+        q.topLeft = push(topLeft)
+        q.topRight = push(topRight)
+        q.bottomLeft = push(bottomLeft)
+        q.bottomRight = push(bottomRight)
+        return q
+    }
+}
+
 // MARK: - Book Spine Detection, Perspective Flattening, Finger Cleanup & OCR Engine
 
 final class BookSpineProcessor {
@@ -167,8 +219,20 @@ final class BookSpineProcessor {
     /// Đảm bảo ảnh trang đôi luôn xoay nằm ngang đúng chiều đọc (Notch bên trái -> xoay ngược chiều kim đồng hồ 90°)
     func ensureLandscapeSpread(_ image: UIImage, isTwoPageMode: Bool, landscapeFlipped180: Bool = false) -> UIImage {
         let normalized = normalizeOrientation(image)
+        return orientSpread(
+            normalized,
+            sourceIsPortrait: normalized.size.height > normalized.size.width * 1.02,
+            isTwoPageMode: isTwoPageMode,
+            landscapeFlipped180: landscapeFlipped180
+        )
+    }
+
+    /// Xoay ảnh trang đôi dựa theo hướng của ẢNH CHỤP GỐC (không phải ảnh đã cắt),
+    /// vì sau khi cắt sát trang sách, tỷ lệ khung có thể không còn phản ánh hướng cầm máy.
+    func orientSpread(_ image: UIImage, sourceIsPortrait: Bool, isTwoPageMode: Bool, landscapeFlipped180: Bool) -> UIImage {
+        let normalized = normalizeOrientation(image)
         guard isTwoPageMode else { return normalized }
-        if normalized.size.height > normalized.size.width * 1.02 {
+        if sourceIsPortrait {
             // Khi khóa màn hình dọc và cầm ngang máy (Notch bên trái), đỉnh ảnh nằm bên trái sách -> xoay 90° ngược chiều kim đồng hồ
             return rotate90Degrees(normalized, clockwise: landscapeFlipped180)
         } else if landscapeFlipped180 {
@@ -198,41 +262,87 @@ final class BookSpineProcessor {
         }
     }
 
-    /// Tự động phát hiện và nắn phẳng 4 góc trang sách bằng Vision + CIPerspectiveCorrection
-    func autoCropAndFlattenBook(_ image: UIImage) -> UIImage {
+    /// Chuẩn bị ảnh trang đôi/đơn từ ảnh chụp thô: cắt & nắn phẳng trang sách TRƯỚC, sau đó mới xoay ngang.
+    /// `hint` là 4 góc trang sách đã thấy trên Preview ngay lúc chụp (nếu có).
+    func prepareSpread(
+        _ rawShot: UIImage,
+        hint: PageQuad?,
+        isTwoPageMode: Bool,
+        landscapeFlipped180: Bool
+    ) -> UIImage {
+        let normalized = normalizeOrientation(rawShot)
+        let flattened = autoCropAndFlattenBook(normalized, hint: hint)
+        return orientSpread(
+            flattened,
+            sourceIsPortrait: normalized.size.height > normalized.size.width * 1.02,
+            isTwoPageMode: isTwoPageMode,
+            landscapeFlipped180: landscapeFlipped180
+        )
+    }
+
+    /// Tự động phát hiện và nắn phẳng 4 góc trang sách bằng Vision + CIPerspectiveCorrection.
+    /// Ảnh được chụp rộng (kèm phần rìa/nền bàn), bước này mới cắt lấy đúng trang sách:
+    /// 1. Dò trang sách trên ảnh chụp độ phân giải cao (AI nhận diện tài liệu, rồi tới hình chữ nhật)
+    /// 2. Nếu không dò được, dùng 4 góc đã thấy trên Preview lúc bấm chụp
+    /// 3. Nếu vẫn không có, giữ nguyên ảnh gốc (người dùng chỉnh tay sau)
+    func autoCropAndFlattenBook(_ image: UIImage, hint: PageQuad? = nil) -> UIImage {
         let normalized = normalizeOrientation(image)
         guard let cgImage = normalized.cgImage else { return normalized }
 
-        let request = VNDetectRectanglesRequest()
-        request.minimumAspectRatio = 0.45
-        request.maximumAspectRatio = 2.2
-        request.minimumSize = 0.38
-        request.minimumConfidence = 0.68
-        request.maximumObservations = 1
+        let w = CGFloat(cgImage.width)
+        let h = CGFloat(cgImage.height)
+        let imageAspect = w / max(1, h)
 
-        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-        try? handler.perform([request])
-
-        guard let rectObs = request.results?.first else {
+        var quad = detectPageQuad(in: cgImage)
+        if quad == nil, let hint, abs(hint.sourceAspect - imageAspect) < 0.03 {
+            quad = hint
+        }
+        guard let pageQuad = quad?.expanded(by: 0.025) else {
             return normalized
         }
 
-        let w = CGFloat(cgImage.width)
-        let h = CGFloat(cgImage.height)
         let ciImage = CIImage(cgImage: cgImage)
-
         let perspective = CIFilter.perspectiveCorrection()
         perspective.inputImage = ciImage
-        perspective.topLeft = CGPoint(x: rectObs.topLeft.x * w, y: rectObs.topLeft.y * h)
-        perspective.topRight = CGPoint(x: rectObs.topRight.x * w, y: rectObs.topRight.y * h)
-        perspective.bottomLeft = CGPoint(x: rectObs.bottomLeft.x * w, y: rectObs.bottomLeft.y * h)
-        perspective.bottomRight = CGPoint(x: rectObs.bottomRight.x * w, y: rectObs.bottomRight.y * h)
+        perspective.topLeft = CGPoint(x: pageQuad.topLeft.x * w, y: pageQuad.topLeft.y * h)
+        perspective.topRight = CGPoint(x: pageQuad.topRight.x * w, y: pageQuad.topRight.y * h)
+        perspective.bottomLeft = CGPoint(x: pageQuad.bottomLeft.x * w, y: pageQuad.bottomLeft.y * h)
+        perspective.bottomRight = CGPoint(x: pageQuad.bottomRight.x * w, y: pageQuad.bottomRight.y * h)
 
         guard let outputCI = perspective.outputImage,
               let renderedCG = ciContext.createCGImage(outputCI, from: outputCI.extent) else {
             return normalized
         }
         return UIImage(cgImage: renderedCG, scale: 1.0, orientation: .up)
+    }
+
+    /// Dò 4 góc trang sách trên ảnh tĩnh. Bỏ qua kết quả quá nhỏ (dưới 15% diện tích ảnh).
+    func detectPageQuad(in cgImage: CGImage) -> PageQuad? {
+        let aspect = CGFloat(cgImage.width) / CGFloat(max(1, cgImage.height))
+
+        let documentRequest = VNDetectDocumentSegmentationRequest()
+        let rectangleRequest = VNDetectRectanglesRequest()
+        rectangleRequest.minimumAspectRatio = 0.3
+        rectangleRequest.maximumAspectRatio = 1.0 // Vision chỉ nhận giá trị trong [0, 1]
+        rectangleRequest.minimumSize = 0.3
+        rectangleRequest.minimumConfidence = 0.5
+        rectangleRequest.quadratureTolerance = 40
+        rectangleRequest.maximumObservations = 4
+
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        try? handler.perform([documentRequest, rectangleRequest])
+
+        func isLargeEnough(_ obs: VNRectangleObservation) -> Bool {
+            obs.confidence >= 0.5 && obs.boundingBox.width * obs.boundingBox.height >= 0.15
+        }
+
+        if let doc = documentRequest.results?.first, isLargeEnough(doc) {
+            return PageQuad(doc, sourceAspect: aspect)
+        }
+        let largest = (rectangleRequest.results ?? []).filter(isLargeEnough).max {
+            $0.boundingBox.width * $0.boundingBox.height < $1.boundingBox.width * $1.boundingBox.height
+        }
+        return largest.map { PageQuad($0, sourceAspect: aspect) }
     }
 
     /// Thuật toán tự động dò vị trí gáy sách (Spine Detection) trong vùng trung tâm [38% ... 62%]
@@ -422,17 +532,18 @@ final class BookSpineProcessor {
         enhancement: EnhancementFilter,
         gutterTrimRatio: CGFloat = 0.015,
         removeFingers: Bool = true,
-        landscapeFlipped180: Bool = false
+        landscapeFlipped180: Bool = false,
+        pageQuadHint: PageQuad? = nil
     ) -> [ScannedBookPage] {
         return autoreleasepool {
             let groupID = UUID()
-            // Xoay ngang ảnh theo đúng hướng cầm ngang của chế độ 2 trang trước khi cắt phẳng & tách đôi
-            let orientedRaw = ensureLandscapeSpread(
+            // Cắt & nắn phẳng trang sách từ ảnh chụp rộng, rồi xoay ngang đúng hướng cầm máy của chế độ 2 trang
+            let spreadImage = prepareSpread(
                 rawShot,
+                hint: pageQuadHint,
                 isTwoPageMode: twoPageMode,
                 landscapeFlipped180: landscapeFlipped180
             )
-            let spreadImage = autoCropAndFlattenBook(orientedRaw)
             guard let cgImage = spreadImage.cgImage else { return [] }
 
             let width = CGFloat(cgImage.width)
@@ -650,7 +761,7 @@ final class VFlatCameraController: NSObject, ObservableObject {
     @Published var autoFillProgress: CGFloat = 0.0
     @Published var autoStatus: AutoCaptureStatus = .noBookDetected
     @Published var isTorchOn: Bool = false
-    @Published var holdDurationSeconds: Double = 1.2
+    @Published var holdDurationSeconds: Double = 0.6
     @Published var shutterFlashTrigger: Bool = false
     @Published var cameraPermissionDenied: Bool = false
     /// Tỷ lệ rộng/cao của khung hình video (dọc), dùng để quy đổi khung sách sang tọa độ Preview (resizeAspectFill)
@@ -662,10 +773,15 @@ final class VFlatCameraController: NSObject, ObservableObject {
     private let photoOutput = AVCapturePhotoOutput()
     private let videoOutput = AVCaptureVideoDataOutput()
 
-    var onPhotoCaptured: ((UIImage) -> Void)?
+    /// Ảnh chụp + 4 góc trang sách thấy trên Preview lúc bấm chụp (dùng để cắt & nắn phẳng sau)
+    var onPhotoCaptured: ((UIImage, PageQuad?) -> Void)?
 
-    private var previousLumaGrid: [UInt8] = []
+    private var previousLumaGrid: [UInt8] = []      // Lưới độ sáng trung bình theo ô (đo rung tay)
+    private var previousDetailGrid: [UInt8] = []    // Lưới điểm chi tiết (so sánh nội dung trang mới/cũ)
     private var lastCapturedLumaGrid: [UInt8] = []
+    private var previousFrameQuad: PageQuad?         // Chỉ dùng trên videoOutputQueue
+    private var lastSeenPageQuad: PageQuad?          // Chỉ dùng trên main thread
+    private var pendingCaptureQuadHint: PageQuad?    // Chỉ dùng trên main thread
     private var lastFrameTimestamp: CFTimeInterval = 0
     private var stableElapsedSeconds: Double = 0
     private var consecutiveBookDetectedFrames: Int = 0
@@ -738,6 +854,7 @@ final class VFlatCameraController: NSObject, ObservableObject {
         if session.canAddOutput(photoOutput) {
             session.addOutput(photoOutput)
             photoOutput.isHighResolutionCaptureEnabled = true
+            photoOutput.maxPhotoQualityPrioritization = .quality
         }
 
         videoOutput.videoSettings = [
@@ -776,7 +893,8 @@ final class VFlatCameraController: NSObject, ObservableObject {
     func triggerManualCapture() {
         guard !isCapturingPhoto else { return }
         isCapturingPhoto = true
-        lastCapturedLumaGrid = previousLumaGrid
+        lastCapturedLumaGrid = previousDetailGrid
+        pendingCaptureQuadHint = isBookDetected ? lastSeenPageQuad : nil
         let feedback = UIImpactFeedbackGenerator(style: .medium)
         feedback.impactOccurred()
 
@@ -794,6 +912,8 @@ final class VFlatCameraController: NSObject, ObservableObject {
         sessionQueue.async {
             let settings = AVCapturePhotoSettings()
             settings.isHighResolutionPhotoEnabled = true
+            // Cân bằng tốc độ/chất lượng: chụp nhanh hơn để giảm nhòe khi cầm tay
+            settings.photoQualityPrioritization = .balanced
             if let conn = self.photoOutput.connection(with: .video),
                conn.isVideoOrientationSupported {
                 conn.videoOrientation = .portrait
@@ -848,7 +968,15 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
             // Bỏ qua frame lỗi, vẫn tiếp tục kiểm tra nội dung giấy/chữ ở vùng trung tâm
         }
 
-        let quad = bestPageQuad()
+        let quad = bestPageQuad(bufferAspect: bufferAspect)
+
+        // Độ dịch chuyển của khung sách giữa 2 frame: rung tay nhẹ chỉ làm khung xê dịch rất ít
+        var quadShift: CGFloat = 0
+        if let current = quad?.corners, let previous = previousFrameQuad {
+            quadShift = current.maxCornerDistance(to: previous)
+        }
+        previousFrameQuad = quad?.corners
+        let quadForHint = quad?.corners
 
         // 3. Xác minh bên trong khung thật sự là trang giấy có chữ in (tránh tự chụp khi chĩa vào bàn/sàn nhà)
         //    Nếu camera để sát sách (không thấy mép sách), kiểm tra vùng trung tâm khung hình.
@@ -888,6 +1016,9 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
             if abs(self.previewBufferAspect - bufferAspect) > 0.001 {
                 self.previewBufferAspect = bufferAspect
             }
+            if rawBookDetected {
+                self.lastSeenPageQuad = quadForHint
+            }
             if confirmedBookPresent {
                 if !self.isBookDetected {
                     self.detectedBookRect = candidateRect
@@ -917,7 +1048,7 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
                 if motionScore > 0.034 {
                     self.pageTurnMotionFrames += 1
                 }
-                if self.pageTurnMotionFrames >= 2 && diffFromLastCapture > 0.025 && motionScore < 0.018 {
+                if self.pageTurnMotionFrames >= 2 && diffFromLastCapture > 0.025 && motionScore < 0.03 {
                     self.stableElapsedSeconds = 0
                     self.autoFillProgress = 0
                     self.autoStatus = .stabilizing(progress: 0)
@@ -925,8 +1056,10 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
                 return
             }
 
-            // Chỉ khi ĐÃ NHẬN DIỆN ĐƯỢC TRANG SÁCH + giữ máy/sách đứng yên (motionScore < 0.015) mới tăng thanh xanh ngọc
-            if motionScore < 0.015 {
+            // Chụp kiểu vFlat: chỉ cần thấy trang sách và cầm máy TƯƠNG ĐỐI yên (cho phép rung tay nhẹ),
+            // ảnh sẽ được chụp rộng kèm phần rìa rồi cắt & nắn phẳng ở bước xử lý sau.
+            let isRoughlyStill = motionScore < 0.03 && quadShift < 0.035
+            if isRoughlyStill {
                 self.stableElapsedSeconds += dt
                 let progress = min(1.0, max(0.0, CGFloat(self.stableElapsedSeconds / self.holdDurationSeconds)))
                 self.autoFillProgress = progress
@@ -937,9 +1070,14 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
                     self.pageTurnMotionFrames = 0
                     self.triggerManualCapture()
                 }
+            } else if motionScore > 0.08 {
+                // Di chuyển mạnh / đang lật trang -> đếm lại từ đầu
+                self.stableElapsedSeconds = 0
+                self.autoFillProgress = 0
+                self.autoStatus = .stabilizing(progress: 0)
             } else {
-                // Nếu tay đang di chuyển hoặc lật sách, hạ thanh đếm về 0
-                self.stableElapsedSeconds = max(0.0, self.stableElapsedSeconds - dt * 2.8)
+                // Rung tay vừa phải: chỉ giảm từ từ, không bắt người dùng giữ lại từ đầu
+                self.stableElapsedSeconds = max(0.0, self.stableElapsedSeconds - dt)
                 let progress = min(1.0, max(0.0, CGFloat(self.stableElapsedSeconds / self.holdDurationSeconds)))
                 self.autoFillProgress = progress
                 self.autoStatus = .stabilizing(progress: progress)
@@ -950,6 +1088,7 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
     /// Khung trang sách tìm được trong frame (tọa độ chuẩn hóa, gốc trên-trái, theo khung hình dọc)
     private struct DetectedPageQuad {
         let rect: CGRect
+        let corners: PageQuad
         let confidence: Float
         let isDocument: Bool
     }
@@ -962,7 +1101,7 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
     }
 
     /// Chọn khung trang sách tốt nhất: ưu tiên kết quả AI nhận diện tài liệu, sau đó đến hình chữ nhật lớn nhất
-    private func bestPageQuad() -> DetectedPageQuad? {
+    private func bestPageQuad(bufferAspect: CGFloat) -> DetectedPageQuad? {
         func toTopLeftRect(_ bbox: CGRect) -> CGRect {
             CGRect(x: bbox.minX, y: 1.0 - bbox.maxY, width: bbox.width, height: bbox.height)
         }
@@ -970,7 +1109,12 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
         if let doc = documentRequest.results?.first,
            doc.confidence >= 0.5,
            doc.boundingBox.width * doc.boundingBox.height >= 0.15 {
-            return DetectedPageQuad(rect: toTopLeftRect(doc.boundingBox), confidence: doc.confidence, isDocument: true)
+            return DetectedPageQuad(
+                rect: toTopLeftRect(doc.boundingBox),
+                corners: PageQuad(doc, sourceAspect: bufferAspect),
+                confidence: doc.confidence,
+                isDocument: true
+            )
         }
 
         let rects = (rectangleRequest.results ?? []).filter {
@@ -979,7 +1123,12 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
         if let largest = rects.max(by: {
             $0.boundingBox.width * $0.boundingBox.height < $1.boundingBox.width * $1.boundingBox.height
         }) {
-            return DetectedPageQuad(rect: toTopLeftRect(largest.boundingBox), confidence: largest.confidence, isDocument: false)
+            return DetectedPageQuad(
+                rect: toTopLeftRect(largest.boundingBox),
+                corners: PageQuad(largest, sourceAspect: bufferAspect),
+                confidence: largest.confidence,
+                isDocument: false
+            )
         }
         return nil
     }
@@ -1079,14 +1228,29 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
 
         let gridW = 26
         let gridH = 36
+        // currentGrid: trung bình 4x4 điểm trong mỗi ô -> không nhạy với nét chữ nhỏ khi tay rung nhẹ
+        // detailGrid: 1 điểm giữa ô -> nhạy với nội dung, dùng để phân biệt trang mới với trang vừa chụp
         var currentGrid = [UInt8](repeating: 0, count: gridW * gridH)
+        var detailGrid = [UInt8](repeating: 0, count: gridW * gridH)
+        let cellW = max(1, width / gridW)
+        let cellH = max(1, height / gridH)
 
         for gy in 0..<gridH {
-            let py = min(height - 1, (gy * height) / gridH + (height / (gridH * 2)))
-            let rowPtr = ptr + py * bytesPerRow
             for gx in 0..<gridW {
-                let px = min(width - 1, (gx * width) / gridW + (width / (gridW * 2)))
-                currentGrid[gy * gridW + gx] = rowPtr[px]
+                var sum = 0
+                for sy in 0..<4 {
+                    let py = min(height - 1, gy * cellH + (cellH * (2 * sy + 1)) / 8)
+                    let rowPtr = ptr + py * bytesPerRow
+                    for sx in 0..<4 {
+                        let px = min(width - 1, gx * cellW + (cellW * (2 * sx + 1)) / 8)
+                        sum += Int(rowPtr[px])
+                    }
+                }
+                currentGrid[gy * gridW + gx] = UInt8(sum / 16)
+
+                let cy = min(height - 1, gy * cellH + cellH / 2)
+                let cx = min(width - 1, gx * cellW + cellW / 2)
+                detailGrid[gy * gridW + gx] = ptr[cy * bytesPerRow + cx]
             }
         }
 
@@ -1099,14 +1263,15 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
             motionScore = Double(diffSum) / Double(currentGrid.count * 255)
         }
         previousLumaGrid = currentGrid
+        previousDetailGrid = detailGrid
 
         var diffFromLastCapture = 1.0
-        if lastCapturedLumaGrid.count == currentGrid.count {
+        if lastCapturedLumaGrid.count == detailGrid.count {
             var capDiff = 0
-            for i in 0..<currentGrid.count {
-                capDiff += abs(Int(currentGrid[i]) - Int(lastCapturedLumaGrid[i]))
+            for i in 0..<detailGrid.count {
+                capDiff += abs(Int(detailGrid[i]) - Int(lastCapturedLumaGrid[i]))
             }
-            diffFromLastCapture = Double(capDiff) / Double(currentGrid.count * 255)
+            diffFromLastCapture = Double(capDiff) / Double(detailGrid.count * 255)
         }
 
         return (motionScore, diffFromLastCapture)
@@ -1131,7 +1296,9 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
               let image = UIImage(data: data) else { return }
 
         DispatchQueue.main.async {
-            self.onPhotoCaptured?(image)
+            let hint = self.pendingCaptureQuadHint
+            self.pendingCaptureQuadHint = nil
+            self.onPhotoCaptured?(image, hint)
         }
     }
 }
@@ -1273,8 +1440,8 @@ struct VFlatMainContainerView: View {
             }
         }
         .onAppear {
-            cameraController.onPhotoCaptured = { capturedImage in
-                handleCapturedPhoto(capturedImage)
+            cameraController.onPhotoCaptured = { capturedImage, pageQuadHint in
+                handleCapturedPhoto(capturedImage, pageQuadHint: pageQuadHint)
             }
             cameraController.startSession()
         }
@@ -1801,15 +1968,15 @@ struct VFlatMainContainerView: View {
 
     private var timerSpeedButton: some View {
         Button {
-            if cameraController.holdDurationSeconds < 1.3 {
-                cameraController.holdDurationSeconds = 1.8
-                showToast("Tốc độ giữ tự chụp: 1.8 giây")
-            } else if cameraController.holdDurationSeconds < 2.0 {
-                cameraController.holdDurationSeconds = 2.5
-                showToast("Tốc độ giữ tự chụp: 2.5 giây")
+            if cameraController.holdDurationSeconds < 0.8 {
+                cameraController.holdDurationSeconds = 1.0
+                showToast("Tốc độ giữ tự chụp: 1.0 giây")
+            } else if cameraController.holdDurationSeconds < 1.2 {
+                cameraController.holdDurationSeconds = 1.5
+                showToast("Tốc độ giữ tự chụp: 1.5 giây")
             } else {
-                cameraController.holdDurationSeconds = 1.2
-                showToast("Tốc độ giữ tự chụp: 1.2 giây")
+                cameraController.holdDurationSeconds = 0.6
+                showToast("Tốc độ giữ tự chụp: 0.6 giây (nhanh)")
             }
         } label: {
             VStack(spacing: 1) {
@@ -1925,7 +2092,7 @@ struct VFlatMainContainerView: View {
 
     // MARK: - Xử lý ảnh vừa chụp
 
-    private func handleCapturedPhoto(_ rawImage: UIImage) {
+    private func handleCapturedPhoto(_ rawImage: UIImage, pageQuadHint: PageQuad?) {
         isProcessingShot = true
         let currentMode = rescanMode
         let isTwoPage = twoPageMode
@@ -1945,7 +2112,8 @@ struct VFlatMainContainerView: View {
                     enhancement: currentFilter,
                     gutterTrimRatio: currentTrim,
                     removeFingers: currentRemoveFingers,
-                    landscapeFlipped180: isFlipped180
+                    landscapeFlipped180: isFlipped180,
+                    pageQuadHint: pageQuadHint
                 )
                 await MainActor.run {
                     self.pages.append(contentsOf: newSplitPages)
@@ -1954,12 +2122,12 @@ struct VFlatMainContainerView: View {
                 }
 
             case .replaceSinglePage(let targetID):
-                let oriented = BookSpineProcessor.shared.ensureLandscapeSpread(
+                let flattened = BookSpineProcessor.shared.prepareSpread(
                     rawImage,
+                    hint: pageQuadHint,
                     isTwoPageMode: isTwoPage,
                     landscapeFlipped180: isFlipped180
                 )
-                let flattened = BookSpineProcessor.shared.autoCropAndFlattenBook(oriented)
                 let enhanced = BookSpineProcessor.shared.applyEnhancement(
                     flattened,
                     filter: currentFilter,
@@ -1989,7 +2157,8 @@ struct VFlatMainContainerView: View {
                     enhancement: currentFilter,
                     gutterTrimRatio: currentTrim,
                     removeFingers: currentRemoveFingers,
-                    landscapeFlipped180: isFlipped180
+                    landscapeFlipped180: isFlipped180,
+                    pageQuadHint: pageQuadHint
                 )
                 await MainActor.run {
                     if let idx = self.pages.firstIndex(where: { $0.id == targetID }) {
