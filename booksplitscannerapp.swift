@@ -73,6 +73,14 @@ enum AutoCaptureStatus: Equatable {
     case waitingForPageTurn // Sau khi chụp xong 1 lượt, chờ người dùng lật sang trang mới
 }
 
+enum AutoCaptureLightProfile: String, CaseIterable, Identifiable {
+    case autoAdaptive = "Tự động theo ánh sáng"
+    case lowLight = "Ưu tiên thiếu sáng"
+    case normalLight = "Ưu tiên ánh sáng tốt"
+
+    var id: String { rawValue }
+}
+
 struct ScannedBookPage: Identifiable, Equatable {
     let id: UUID
     let spreadGroupID: UUID
@@ -760,6 +768,7 @@ final class VFlatCameraController: NSObject, ObservableObject {
     }
     @Published var autoFillProgress: CGFloat = 0.0
     @Published var autoStatus: AutoCaptureStatus = .noBookDetected
+    @Published var captureLightProfile: AutoCaptureLightProfile = .autoAdaptive
     @Published var isTorchOn: Bool = false
     @Published var holdDurationSeconds: Double = 0.6
     @Published var shutterFlashTrigger: Bool = false
@@ -1129,7 +1138,15 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
         for metrics: PageContentMetrics,
         holdDuration: Double
     ) -> AdaptiveCaptureThresholds {
-        let lowLight = metrics.paperLevel < 92
+        let lowLight: Bool
+        switch captureLightProfile {
+        case .autoAdaptive:
+            lowLight = metrics.paperLevel < 92
+        case .lowLight:
+            lowLight = true
+        case .normalLight:
+            lowLight = false
+        }
         let slowHoldMode = holdDuration >= 1.2
 
         var stillMotion = lowLight ? 0.036 : 0.03
@@ -1994,6 +2011,11 @@ struct VFlatMainContainerView: View {
                 Picker("Chế độ làm sạch AI", selection: $enhancementFilter) {
                     ForEach(EnhancementFilter.allCases) { f in
                         Text(f.rawValue).tag(f)
+                    }
+                }
+                Picker("Ngưỡng tự chụp", selection: $cameraController.captureLightProfile) {
+                    ForEach(AutoCaptureLightProfile.allCases) { mode in
+                        Text(mode.rawValue).tag(mode)
                     }
                 }
                 Toggle("Tự xóa ngón tay ở mép sách", isOn: $removeFingersAtEdges)
