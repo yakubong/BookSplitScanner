@@ -17,3 +17,40 @@ Bộ mã nguồn này biên dịch ứng dụng iOS gốc **BookSplitScanner (`v
 1. Mở file **`BookSplitScannerApp.swift`** trên [GitHub](https://github.com) của bạn → bấm biểu tượng **Cây bút (Edit)** → dán toàn bộ nội dung mới từ khung Canvas (`let APP_VERSION = "2.3.0"`) vào → bấm **Commit changes**.
 2. *(Tùy chọn)* Nếu muốn khóa cứng hướng xoay hệ thống trong `Info.plist`, bạn cũng có thể cập nhật thêm file `.github/workflows/build-ipa.yml` và `project.yml` bên dưới.
 3. Vào tab **Actions**, đợi 1–2 phút và tải gói **`BookSplitScanner-v2.3.0-bX`** tại mục **Artifacts**.
+
+## 3. Sprint thực địa: Matrix kiểm thử tự chụp (để hiệu chỉnh ngưỡng)
+
+### 3.1 Mục tiêu vòng test
+- Giảm chụp hụt khi thiếu sáng.
+- Giảm chụp nhầm khi người dùng lật trang nhanh.
+- Theo dõi KPI:
+  - Tỷ lệ auto-capture thành công.
+  - Thời gian hội tụ từ lúc nhận diện sách đến lúc tự chụp.
+
+### 3.2 Matrix kịch bản cần chạy
+- Ánh sáng: **Mạnh / Vừa / Thiếu sáng**
+- Chuyển động tay: **Ổn định / Rung nhẹ / Rung mạnh**
+- Hồ sơ ngưỡng: **Tự động theo ánh sáng / Ưu tiên thiếu sáng / Ưu tiên ánh sáng tốt**
+- Thời gian giữ: **0.6s / 1.0s / 1.5s**
+- Chế độ trang: **1 trang / 2 trang**
+
+## 4. Instrumentation đã có trong app (phục vụ vòng hiệu chỉnh)
+
+- Trong menu Camera (nút `...`) có thể bật **Hiện Debug Auto-Capture**.
+- Overlay debug hiển thị tín hiệu thời gian thực:
+  - `paperLevel`, `paperRatio`, `textTransitions`
+  - `motionScore`, `quadShift`
+  - `decision` pass/fail của vòng auto-capture
+  - Số lần auto-capture pass và latency hội tụ gần nhất
+- App tự hiển thị gợi ý UX:
+  - **“Thiếu sáng → nên bật Low light để dễ tự chụp hơn”** khi phát hiện thiếu sáng kéo dài.
+
+## 5. Regression checklist trước phát hành
+
+- [ ] Không phá luồng chụp rộng trước → cắt/nắn sau trên ảnh full-res.
+- [ ] Fallback về `pageQuadHint` khi ảnh chụp không tự dò được biên trang.
+- [ ] Trạng thái `waitingForPageTurn` vẫn chặn chụp liên tiếp sai thời điểm.
+- [ ] Chế độ 2 trang vẫn tách trang ổn định theo gáy.
+- [ ] So sánh nhanh hành vi giữa profile `Auto` / `Low light` / `Normal light`.
+- [ ] Chạy lại build iOS trên GitHub Actions và kiểm tra artifact `.ipa`.
+- [ ] Test thủ công tối thiểu trên 2 thiết bị iPhone đời khác nhau.

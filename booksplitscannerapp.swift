@@ -81,6 +81,21 @@ enum AutoCaptureLightProfile: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+enum CaptureTriggerSource: String {
+    case manual = "manual"
+    case auto = "auto"
+}
+
+struct AutoCaptureDiagnosticsSnapshot {
+    let timestamp: Date
+    let paperLevel: Double
+    let paperRatio: Double
+    let textTransitions: Int
+    let motionScore: Double
+    let quadShift: CGFloat
+    let decision: String
+}
+
 struct ScannedBookPage: Identifiable, Equatable {
     let id: UUID
     let spreadGroupID: UUID
@@ -769,6 +784,12 @@ final class VFlatCameraController: NSObject, ObservableObject {
     @Published var autoFillProgress: CGFloat = 0.0
     @Published var autoStatus: AutoCaptureStatus = .noBookDetected
     @Published var captureLightProfile: AutoCaptureLightProfile = .autoAdaptive
+    @Published var diagnosticsEnabled: Bool = false
+    @Published private(set) var diagnosticsSnapshot: AutoCaptureDiagnosticsSnapshot?
+    @Published private(set) var diagnosticsEvents: [String] = []
+    @Published private(set) var lowLightSuggestionText: String? = nil
+    @Published private(set) var lastAutoCaptureConvergenceSeconds: Double? = nil
+    @Published private(set) var autoCaptureSuccessCount: Int = 0
     @Published var isTorchOn: Bool = false
     @Published var holdDurationSeconds: Double = 0.6
     @Published var shutterFlashTrigger: Bool = false
@@ -792,12 +813,16 @@ final class VFlatCameraController: NSObject, ObservableObject {
     private var lastSeenPageQuad: PageQuad?          // Chỉ dùng trên main thread
     private var pendingCaptureQuadHint: PageQuad?    // Chỉ dùng trên main thread
     private var lastFrameTimestamp: CFTimeInterval = 0
+    private var firstBookDetectedTimestamp: CFTimeInterval?
     private var stableElapsedSeconds: Double = 0
     private var consecutiveBookDetectedFrames: Int = 0
     private var consecutiveNoBookFrames: Int = 0
+    private var sustainedLowLightFrames: Int = 0
     private var pageTurnMotionFrames: Int = 0
     private var isCapturingPhoto: Bool = false
     private var isSessionConfigured: Bool = false
+    private var lastDiagnosticsTag: String = ""
+    private var lastDiagnosticsEmitTimestamp: CFTimeInterval = 0
 
     // Tạo sẵn 1 lần, chỉ dùng trên videoOutputQueue
     private let documentRequest = VNDetectDocumentSegmentationRequest()
@@ -899,11 +924,20 @@ final class VFlatCameraController: NSObject, ObservableObject {
         }
     }
 
-    func triggerManualCapture() {
+    func triggerManualCapture(source: CaptureTriggerSource = .manual) {
         guard !isCapturingPhoto else { return }
         isCapturingPhoto = true
         lastCapturedLumaGrid = previousDetailGrid
         pendingCaptureQuadHint = isBookDetected ? lastSeenPageQuad : nil
+        if source == .auto {
+            autoCaptureSuccessCount += 1
+            if let t0 = firstBookDetectedTimestamp {
+                lastAutoCaptureConvergenceSeconds = max(0, CACurrentMediaTime() - t0)
+            }
+            appendDiagnosticsEvent("AUTO_CAPTURE_PASS source=\(source.rawValue)")
+        } else {
+            appendDiagnosticsEvent("CAPTURE_MANUAL source=\(source.rawValue)")
+        }
         let feedback = UIImpactFeedbackGenerator(style: .medium)
         feedback.impactOccurred()
 
@@ -942,6 +976,15 @@ final class VFlatCameraController: NSObject, ObservableObject {
                     self.autoFillProgress = 0
                 }
             }
+        }
+    }
+
+    private func appendDiagnosticsEvent(_ message: String) {
+        guard diagnosticsEnabled else { return }
+        let ts = String(format: "%.2f", CACurrentMediaTime())
+        diagnosticsEvents.append("[\(ts)] \(message)")
+        if diagnosticsEvents.count > 80 {
+            diagnosticsEvents.removeFirst(diagnosticsEvents.count - 80)
         }
     }
 }
@@ -1042,17 +1085,58 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
             }
             self.isBookDetected = confirmedBookPresent
 
+            if confirmedBookPresent {
+                if self.firstBookDetectedTimestamp == nil {
+                    self.firstBookDetectedTimestamp = now
+                }
+            } else {
+                self.firstBookDetectedTimestamp = nil
+            }
+
+            if metrics.paperLevel < 88 {
+                self.sustainedLowLightFrames += 1
+            } else {
+                self.sustainedLowLightFrames = 0
+            }
+
+            if self.captureLightProfile == .autoAdaptive, self.sustainedLowLightFrames >= 18 {
+                self.lowLightSuggestionText = "Thiếu sáng → nên bật Low light để dễ tự chụp hơn"
+            } else if self.captureLightProfile == .lowLight {
+                self.lowLightSuggestionText = nil
+            } else if self.sustainedLowLightFrames < 8 {
+                self.lowLightSuggestionText = nil
+            }
+
             guard self.autoCaptureEnabled, !self.isCapturingPhoto else { return }
             let adaptive = self.adaptiveCaptureThresholds(for: metrics, holdDuration: self.holdDurationSeconds)
+            var diagnosticsTag = "PASS_STABILIZING"
 
             // QUAN TRỌNG: Nếu KHÔNG nhận diện được trang sách -> Tuyệt đối không tự chụp, đưa thanh đếm về 0% ngay lập tức!
             if !confirmedBookPresent {
+                diagnosticsTag = "FAIL_NO_BOOK"
                 self.stableElapsedSeconds = 0
                 self.autoFillProgress = 0.0
                 if self.autoStatus != .waitingForPageTurn {
                     self.autoStatus = .noBookDetected
                 } else if motionScore > adaptive.noBookMotionThreshold {
                     self.pageTurnMotionFrames += 1
+                }
+                if self.diagnosticsEnabled {
+                    let shouldEmit = self.lastDiagnosticsTag != diagnosticsTag || now - self.lastDiagnosticsEmitTimestamp >= 0.7
+                    if shouldEmit {
+                        self.lastDiagnosticsTag = diagnosticsTag
+                        self.lastDiagnosticsEmitTimestamp = now
+                        self.diagnosticsSnapshot = AutoCaptureDiagnosticsSnapshot(
+                            timestamp: Date(),
+                            paperLevel: metrics.paperLevel,
+                            paperRatio: metrics.paperRatio,
+                            textTransitions: metrics.textTransitions,
+                            motionScore: motionScore,
+                            quadShift: quadShift,
+                            decision: diagnosticsTag
+                        )
+                        self.appendDiagnosticsEvent("\(diagnosticsTag) profile=\(self.captureLightProfile.rawValue)")
+                    }
                 }
                 return
             }
@@ -1066,9 +1150,29 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
                 if self.pageTurnMotionFrames >= 2 &&
                     diffFromLastCapture > adaptive.pageTurnDiffThreshold &&
                     motionScore < adaptive.pageTurnStillThreshold {
+                    diagnosticsTag = "PASS_PAGE_TURN_READY"
                     self.stableElapsedSeconds = 0
                     self.autoFillProgress = 0
                     self.autoStatus = .stabilizing(progress: 0)
+                } else {
+                    diagnosticsTag = "FAIL_WAIT_PAGE_TURN"
+                }
+                if self.diagnosticsEnabled {
+                    let shouldEmit = self.lastDiagnosticsTag != diagnosticsTag || now - self.lastDiagnosticsEmitTimestamp >= 0.7
+                    if shouldEmit {
+                        self.lastDiagnosticsTag = diagnosticsTag
+                        self.lastDiagnosticsEmitTimestamp = now
+                        self.diagnosticsSnapshot = AutoCaptureDiagnosticsSnapshot(
+                            timestamp: Date(),
+                            paperLevel: metrics.paperLevel,
+                            paperRatio: metrics.paperRatio,
+                            textTransitions: metrics.textTransitions,
+                            motionScore: motionScore,
+                            quadShift: quadShift,
+                            decision: diagnosticsTag
+                        )
+                        self.appendDiagnosticsEvent("\(diagnosticsTag) profile=\(self.captureLightProfile.rawValue)")
+                    }
                 }
                 return
             }
@@ -1084,21 +1188,42 @@ extension VFlatCameraController: AVCaptureVideoDataOutputSampleBufferDelegate, A
                 self.autoStatus = .stabilizing(progress: progress)
 
                 if progress >= 1.0 {
+                    diagnosticsTag = "PASS_TRIGGER_AUTO_CAPTURE"
                     self.stableElapsedSeconds = 0
                     self.pageTurnMotionFrames = 0
-                    self.triggerManualCapture()
+                    self.triggerManualCapture(source: .auto)
                 }
             } else if motionScore > adaptive.hardResetMotionThreshold {
+                diagnosticsTag = "FAIL_HARD_MOTION_RESET"
                 // Di chuyển mạnh / đang lật trang -> đếm lại từ đầu
                 self.stableElapsedSeconds = 0
                 self.autoFillProgress = 0
                 self.autoStatus = .stabilizing(progress: 0)
             } else {
+                diagnosticsTag = "FAIL_SOFT_MOTION_DECAY"
                 // Rung tay vừa phải: chỉ giảm từ từ, không bắt người dùng giữ lại từ đầu
                 self.stableElapsedSeconds = max(0.0, self.stableElapsedSeconds - dt)
                 let progress = min(1.0, max(0.0, CGFloat(self.stableElapsedSeconds / self.holdDurationSeconds)))
                 self.autoFillProgress = progress
                 self.autoStatus = .stabilizing(progress: progress)
+            }
+
+            if self.diagnosticsEnabled {
+                let shouldEmit = self.lastDiagnosticsTag != diagnosticsTag || now - self.lastDiagnosticsEmitTimestamp >= 0.7
+                if shouldEmit {
+                    self.lastDiagnosticsTag = diagnosticsTag
+                    self.lastDiagnosticsEmitTimestamp = now
+                    self.diagnosticsSnapshot = AutoCaptureDiagnosticsSnapshot(
+                        timestamp: Date(),
+                        paperLevel: metrics.paperLevel,
+                        paperRatio: metrics.paperRatio,
+                        textTransitions: metrics.textTransitions,
+                        motionScore: motionScore,
+                        quadShift: quadShift,
+                        decision: diagnosticsTag
+                    )
+                    self.appendDiagnosticsEvent("\(diagnosticsTag) profile=\(self.captureLightProfile.rawValue)")
+                }
             }
         }
     }
@@ -1582,6 +1707,18 @@ struct VFlatMainContainerView: View {
                     Color.white.opacity(0.65)
                         .ignoresSafeArea()
                 }
+
+                if cameraController.diagnosticsEnabled {
+                    VStack {
+                        HStack {
+                            diagnosticsOverlayCard
+                            Spacer()
+                        }
+                        .padding(.leading, 10)
+                        .padding(.top, 42)
+                        Spacer()
+                    }
+                }
             }
             .ignoresSafeArea()
         }
@@ -1850,18 +1987,72 @@ struct VFlatMainContainerView: View {
             badgeColor = Color.green.opacity(0.85)
         }
 
-        return HStack(spacing: 6) {
-            Circle()
-                .fill(cameraController.isBookDetected ? vFlatTeal : Color.gray)
-                .frame(width: 8, height: 8)
-            Text(labelText)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.white)
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(cameraController.isBookDetected ? vFlatTeal : Color.gray)
+                    .frame(width: 8, height: 8)
+                Text(labelText)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white)
+            }
+            if let suggestion = cameraController.lowLightSuggestionText {
+                Text(suggestion)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(Color.yellow.opacity(0.96))
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .background(badgeColor)
         .clipShape(Capsule())
+    }
+
+    private var diagnosticsOverlayCard: some View {
+        let snapshot = cameraController.diagnosticsSnapshot
+        let latencyText: String
+        if let latency = cameraController.lastAutoCaptureConvergenceSeconds {
+            latencyText = String(format: "%.2fs", latency)
+        } else {
+            latencyText = "--"
+        }
+        return VStack(alignment: .leading, spacing: 3) {
+            Text("DEBUG AutoCapture")
+                .font(.caption2.bold())
+            Text("profile=\(cameraController.captureLightProfile.rawValue)")
+                .font(.caption2.monospaced())
+            Text("decision=\(snapshot?.decision ?? "--")")
+                .font(.caption2.monospaced())
+            Text(
+                String(
+                    format: "paper=%.1f ratio=%.2f text=%d",
+                    snapshot?.paperLevel ?? 0,
+                    snapshot?.paperRatio ?? 0,
+                    snapshot?.textTransitions ?? 0
+                )
+            )
+            .font(.caption2.monospaced())
+            Text(
+                String(
+                    format: "motion=%.3f shift=%.3f",
+                    snapshot?.motionScore ?? 0,
+                    snapshot?.quadShift ?? 0
+                )
+            )
+            .font(.caption2.monospaced())
+            Text("AUTO pass=\(cameraController.autoCaptureSuccessCount) latency=\(latencyText)")
+                .font(.caption2.monospaced())
+            if let lastEvent = cameraController.diagnosticsEvents.last {
+                Text(lastEvent)
+                    .font(.caption2.monospaced())
+                    .lineLimit(1)
+            }
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 7)
+        .background(Color.black.opacity(0.74))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
     /// Bảng điều khiển trắng bên phải màn hình ngang (Giống hệt Ảnh 1 & Ảnh 2 của vFlat)
@@ -2018,6 +2209,7 @@ struct VFlatMainContainerView: View {
                         Text(mode.rawValue).tag(mode)
                     }
                 }
+                Toggle("Hiện Debug Auto-Capture", isOn: $cameraController.diagnosticsEnabled)
                 Toggle("Tự xóa ngón tay ở mép sách", isOn: $removeFingersAtEdges)
                 Button {
                     landscapeFlipped180.toggle()
